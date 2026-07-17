@@ -1,0 +1,7 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 标定采集的原始棋盘照片（可随时重拍，体积大，不入库）
+# 标定结果 camera_calib.npz 保留
+ready_code/calib_shots/
