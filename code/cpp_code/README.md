@@ -1,6 +1,6 @@
 # cpp_code — C++ 版 OpenCV 去畸变画面
 
-树莓派 5（aarch64）上的 C++ OpenCV 工程骨架，对应 Python 端 `ready_code/v1.2.py`：
+树莓派 5（aarch64）上的 C++ OpenCV 工程骨架，对应 Python 端 `code/ready_code/v1.2.py`：
 固定曝光/增益/白平衡打开摄像头，载入标定数据，运行时按 `u` 切换 原始/去畸变 画面。
 
 ## 依赖（系统级，需一次性安装）
@@ -40,6 +40,6 @@ cp build/undistort_view .
 
 ## 与 Python 端的关系
 
-- 固定相机参数以 `ready_code/camera_common.py` 为唯一事实来源；本目录 `undistort_view.cpp`
+- 固定相机参数以 `code/ready_code/camera_common.py` 为唯一事实来源；本目录 `undistort_view.cpp`
   里的常量是它的副本，改参数需两边同步（或重跑 `tune_camera.py` 后一起更新）。
 - 重新标定后，用 Python 把新的 `camera_calib.npz` 再导出成本目录的 `camera_calib.yaml`。

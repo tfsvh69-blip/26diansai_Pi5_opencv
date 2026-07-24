@@ -26,10 +26,10 @@ DEVICE = "/dev/video0"
 FRAME_W, FRAME_H, FRAME_FPS = 640, 480, 30
 
 # 固定参数：由 tune_camera.py 现场调出，2026-07-17 记录（与 v1.1.py 一致）
-EXPOSURE_TIME_ABSOLUTE = 13       # 曝光时间，范围 10~626
-GAIN = 2                          # 增益，范围 1~8
-WHITE_BALANCE_TEMPERATURE = 4532  # 白平衡色温，范围 2800~6500
-BRIGHTNESS = -11                  # 亮度，范围 -64~64
+EXPOSURE_TIME_ABSOLUTE = 10       # 曝光时间，范围 10~626
+GAIN = 1                          # 增益，范围 1~8
+WHITE_BALANCE_TEMPERATURE = 3399  # 白平衡色温，范围 2800~6500
+BRIGHTNESS = 10                  # 亮度，范围 -64~64
 
 # 标定板参数：实测 chessboard_a4.png 为 9x6 内角点、方格 25mm
 CHESSBOARD_SIZE = (9, 6)   # (列内角点数, 行内角点数)

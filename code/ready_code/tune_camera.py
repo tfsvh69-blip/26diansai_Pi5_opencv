@@ -19,13 +19,59 @@ USB摄像头交互式调参工具 - 固定曝光/增益/白平衡
   brightness               : -64~64 (默认 0)
 
 按键:
-  q / ESC : 退出，并在终端打印最终数值（记下来填进 v1.1.py）
+  q / ESC : 退出，退出时【自动把最终数值写回 camera_common.py】（唯一事实来源），
+            调完即生效，无需手抄。calibrate_camera.py / v1.2.py / record_dataset.py
+            都从 camera_common.py 读参数，所以只写这一处即可。
+            (v1.0/v1.1 是自带副本的旧版，不受影响，需要的话自行同步。)
 """
 
+import os
+import re
 import subprocess
 import cv2
 
 DEVICE = "/dev/video0"
+
+# 调好后写回的目标：camera_common.py 里的四个常量（唯一事实来源）
+CAMERA_COMMON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "camera_common.py")
+CTRL_TO_CONST = {
+    "exposure_time_absolute": "EXPOSURE_TIME_ABSOLUTE",
+    "gain": "GAIN",
+    "white_balance_temperature": "WHITE_BALANCE_TEMPERATURE",
+    "brightness": "BRIGHTNESS",
+}
+
+
+def save_to_common(values):
+    """把调好的数值写回 camera_common.py，只改常量值、保留注释。"""
+    try:
+        with open(CAMERA_COMMON, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        print(f"⚠ 无法读取 {CAMERA_COMMON}: {e}")
+        return
+
+    missing = []
+    for ctrl, const in CTRL_TO_CONST.items():
+        v = values.get(ctrl)
+        if v is None:
+            continue
+        # 只替换 "常量名 = 数字" 里的数字，行尾注释原样保留
+        pattern = re.compile(rf"^({const}\s*=\s*)(-?\d+)", re.MULTILINE)
+        text, n = pattern.subn(lambda m: m.group(1) + str(v), text)
+        if n == 0:
+            missing.append(const)
+
+    if missing:
+        print(f"⚠ 未在 camera_common.py 找到这些常量，未写入: {', '.join(missing)}")
+
+    try:
+        with open(CAMERA_COMMON, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError as e:
+        print(f"⚠ 写回 {CAMERA_COMMON} 失败: {e}")
+        return
+    print(f"✅ 已写回 {CAMERA_COMMON}")
 # 该摄像头 MJPG 模式下只支持 1280x720 / 640x480 两档分辨率
 # (v4l2-ctl --list-formats-ext 实测)，没有 640x360，因此用最低档 640x480。
 FRAME_W, FRAME_H, FRAME_FPS = 640, 480, 30
@@ -98,9 +144,10 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
 
-    print("\n最终数值（填进 v1.1.py 里）：")
+    print("\n最终数值：")
     for name, value in last_values.items():
         print(f"  {name} = {value}")
+    save_to_common(last_values)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 // USB摄像头 C++ 版 - 固定曝光/增益/白平衡 + 可切换去畸变
-// 对应 Python 的 ready_code/v1.2.py，行为一致，做 C++ 工程骨架。
+// 对应 Python 的 code/ready_code/v1.2.py，行为一致，做 C++ 工程骨架。
 //
 // 编译: 见同目录 build.sh 或 CMakeLists.txt
 // 运行: ./undistort_view

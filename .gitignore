@@ -4,4 +4,7 @@ __pycache__/
 
 # 标定采集的原始棋盘照片（可随时重拍，体积大，不入库）
 # 标定结果 camera_calib.npz 保留
-ready_code/calib_shots/
+code/ready_code/calib_shots/
+
+# 数据采集录制的视频（体积大，属数据不属代码，不入库）
+code/record_code/output/

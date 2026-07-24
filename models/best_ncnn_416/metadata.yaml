@@ -1,0 +1,20 @@
+description: Ultralytics YOLO11n model trained on C:/luhao/Projects/Vision/26diansai/yolo_1/vedio/result/dataset_20260723_185257_1_6595_4/a/v8/a.yaml
+author: Ultralytics
+date: '2026-07-24T09:36:13.584904'
+version: 8.4.104
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: detect
+head: Detect
+batch: 1
+imgsz:
+- 416
+- 416
+names:
+  0: ball
+args:
+  batch: 1
+  quantize: null
+channels: 3
+end2end: false
