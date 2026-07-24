@@ -4,10 +4,15 @@
 环境: /home/hao/vision_env/bin/python3
 用法:
     /home/hao/vision_env/bin/python3 code/task_code/v1.0.py [--size 320|416|640]
-    #   --size 320      初始模型规格(默认 320，最流畅；运行时 1/2/3 可切)
-    #   --conf 0.25     置信度阈值
+    #   --size 320      模型规格；【不给则用上次保存的配置】，给了则本次覆盖并保存
+    #   --conf 0.25     置信度阈值；同样不给用配置、给了覆盖并保存
     #   --any           串口找不到固定口时放宽到任意 CH340/ttyUSB
     #   --no-serial     只看检测、不发串口(纯视觉调试)
+
+配置持久化：
+  规格(size)、是否去畸变(undistort)、置信度(conf) 存在 task_config.json，
+  运行时用 1/2/3 切规格、u 切去畸变都会【自动保存】，下次启动自动沿用上次的值。
+  首次运行按内置默认(size=320, 去畸变开, conf=0.25)。
 
 功能：
   - 复用 code/ready_code/camera_common.py 固定曝光/增益/白平衡 + 【默认去畸变】(项目约定)；
@@ -42,6 +47,7 @@ from yolo_ncnn import YoloNcnn, draw_detections, MODELS_DIR  # noqa: E402
 from serial_link import SerialLink, Disconnected            # noqa: E402
 from camera_link import CameraLink, CameraLost              # noqa: E402
 import protocol                     # noqa: E402
+import config                       # noqa: E402
 
 SIZES = (320, 416, 640)
 
@@ -64,11 +70,21 @@ def pick_primary(dets):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--size", type=int, default=320, choices=SIZES)
-    ap.add_argument("--conf", type=float, default=0.25)
+    ap.add_argument("--size", type=int, default=None, choices=SIZES,
+                    help="YOLO 规格；不给则用上次保存的配置")
+    ap.add_argument("--conf", type=float, default=None, help="置信度阈值；不给则用配置")
     ap.add_argument("--any", action="store_true", help="串口放宽到任意 CH340/ttyUSB")
     ap.add_argument("--no-serial", action="store_true", help="不发串口，只看检测")
     args = ap.parse_args()
+
+    # 载入上次保存的配置；命令行参数(若给)覆盖之
+    cfg = config.load()
+    if args.size is not None:
+        cfg["size"] = args.size
+    if args.conf is not None:
+        cfg["conf"] = args.conf
+    print(f"⚙️  配置文件: {config.CONFIG_FILE}")
+    print(f"    载入设置: size={cfg['size']} undistort={cfg['undistort']} conf={cfg['conf']}")
 
     cam = CameraLink()            # 锁定 /dev/video0，热插拔自动重连
     w, h = cam.wait_and_open()    # 没插摄像头就阻塞等待，插上自动连
@@ -85,15 +101,22 @@ def main():
 
     maps = build_maps((w, h))
     if calib is not None:
-        print(f"   已载入标定 (RMS={calib['rms']:.3f}px)，默认去畸变。")
+        print(f"   已载入标定 (RMS={calib['rms']:.3f}px)。")
     else:
-        print("   ⚠️ 未找到 camera_calib.npz，用原始画面。")
-    undistort_on = maps is not None
+        print("   ⚠️ 未找到 camera_calib.npz，只能用原始画面。")
+    undistort_pref = cfg["undistort"]            # 用户偏好（会持久化）
+    undistort_on = undistort_pref and maps is not None
 
     cache = {}
-    cur_size = args.size
+    cur_size = cfg["size"]
     det = get_model(cache, cur_size)
-    det.conf_thres = args.conf
+    det.conf_thres = cfg["conf"]
+
+    def persist():
+        """把当前设置写回配置文件（size / undistort / conf）。"""
+        cfg["size"] = cur_size
+        cfg["undistort"] = undistort_pref
+        config.save(cfg)
 
     link = None
     if not args.no_serial:
@@ -187,24 +210,28 @@ def main():
             if maps is None:
                 print("   无标定，无法切去畸变。")
             else:
-                undistort_on = not undistort_on
-                print(f"   切换为: {'去畸变' if undistort_on else '原始'}")
+                undistort_pref = not undistort_pref
+                undistort_on = undistort_pref
+                persist()
+                print(f"   切换为: {'去畸变' if undistort_on else '原始'}（已保存）")
         elif key in (ord("1"), ord("2"), ord("3")):
             new_size = SIZES[key - ord("1")]
             if new_size != cur_size:
                 cur_size = new_size
                 det = get_model(cache, cur_size)
-                det.conf_thres = args.conf
+                det.conf_thres = cfg["conf"]
                 fps_ema = None
-                print(f"   切换模型: {cur_size}")
+                persist()
+                print(f"   切换模型: {cur_size}（已保存）")
 
+    persist()   # 退出时保存最终设置（含命令行覆盖的值）
     cam.close()
     cv2.destroyAllWindows()
     for m in cache.values():
         m.release()
     if link is not None:
         link.close()
-    print(f"已退出。共发送 {tx_count} 帧串口数据。")
+    print(f"已退出。共发送 {tx_count} 帧串口数据。设置已保存到 {os.path.basename(config.CONFIG_FILE)}。")
 
 
 if __name__ == "__main__":

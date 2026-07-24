@@ -8,3 +8,6 @@ code/ready_code/calib_shots/
 
 # 数据采集录制的视频（体积大，属数据不属代码，不入库）
 code/record_code/output/
+
+# 任务运行时的本机配置（用户在本机调出的规格/去畸变/阈值，属本机状态，不入库）
+code/task_code/task_config.json
