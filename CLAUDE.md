@@ -11,7 +11,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 代码按类别分目录：`code/ready_code`（相机基础：调参/标定/预览/公共模块）、
 `code/record_code`（数据采集录像）、`code/detect_code`（NCNN 检测与性能基准）、
-`code/task_code`（正式题目：检测+串口，从 v1.0 起编号）、`code/cpp_code`（C++ 去畸变骨架）；
+`code/task_code`（正式题目：YOLO检测+串口，从 v1.0 起编号）、
+`code/opencv_code`（纯 OpenCV 钢珠检测，不用 YOLO，帧率 89FPS）、
+`code/cpp_code`（C++ 去畸变骨架）；
 模型在 `models/`、文档在 `docs/`、参考资料在 `reference/`。
 
 ## 运行环境
@@ -22,7 +24,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 /home/hao/vision_env/bin/python3 code/ready_code/<脚本>.py
 ```
 
-- OpenCV 4.13 + numpy 2.4，仅此两个依赖。
+- OpenCV 4.13 + numpy 2.4 + Pillow 12.3（中文渲染用）。
 - 用 `v4l2-ctl`（来自系统包 `v4l-utils`）设置摄像头控制项。
 - 带 `cv2.imshow` 窗口的脚本（除引用外几乎都是）**必须在有显示器/桌面的会话里跑**，
   纯 SSH 无 X 转发会失败。
@@ -41,10 +43,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `code/detect_code/detect_live.py` | 载入 NCNN 模型实时检测预览（复用固定参数 + 默认去畸变） |
 | `code/detect_code/benchmark.py` | 对 320/416/640 三规格测纯推理耗时与端到端 FPS，输出对比 |
 | `code/task_code/v1.0.py` | **正式题目主程序**：实时检测球 + 把主目标球心 X/Y 经串口发给下位机；摄像头/串口双热插拔 |
+| `code/task_code/v1.1.py` | 在 v1.0 基础上加 **BoT-SORT(无ReID)+GMC+卡尔曼滤波**跟踪，保证主目标框选连续性（漏检/遮挡靠预测续上、不因别的球更大而跳目标），最后过 One Euro Filter 平滑坐标再发串口 |
+| `code/task_code/bot_sort.py` | BoT-SORT 轻量实现：ByteTrack 式高/低置信度两级关联 + 稀疏光流 GMC + (cx,cy,w,h) 卡尔曼滤波 + 手写匈牙利分配（不依赖 scipy/lap/ultralytics，本机未装），不单独运行 |
+| `code/task_code/one_euro_filter.py` | One Euro Filter 一维平滑滤波器，供 v1.1 对主目标像素坐标做最后平滑，不单独运行 |
 | `code/task_code/serial_test.py` | 串口收包监视：打印下位机发来的数据，验证链路（支持热插拔） |
 | `code/task_code/serial_link.py` | 串口链路封装：锁定固定物理 USB 口 + 自动等待/断线重连，不单独运行 |
 | `code/task_code/camera_link.py` | 摄像头链路封装：`open_camera` 外包一层等待/掉线重连，不单独运行 |
 | `code/task_code/protocol.py` | 上位机→下位机通信格式定义（`$BALL,found,x,y,n*CHK`），唯一事实来源 |
+| `code/opencv_code/ball_detector.py` | 纯 OpenCV 钢珠检测核心 v2：HoughCircles + 多因素综合评分 + 速度预测跟踪 + 置信度衰减，~89FPS |
+| `code/opencv_code/v1.0.py` | 纯 OpenCV 版正式主程序（替代 YOLO）：检测+串口，复用同一套 camera_link/serial_link/protocol |
+| `code/opencv_code/v1.1.py` | 在 v1.0 基础上把 `ball_detector.py` 的候选圆接入 `task_code/bot_sort.py` 的 BoT-SORT(无ReID)+GMC+卡尔曼滤波，解决"能测到但不连续/多候选间跳目标"的问题，最后过 One Euro Filter 再发串口；不改 v1.0.py / ball_detector.py 一行代码 |
+| `code/opencv_code/tune_detector.py` | 钢珠检测参数调参工具：中文滑条 + 实时视觉反馈（候选/淘汰/主目标 + 拒绝原因） |
+| `code/opencv_code/config.py` | opencv_code 的配置读写（检测参数 + 去畸变偏好 → detector_config.json） |
 
 标定流程：先跑 `calibrate_camera.py`（拍 15~20 张不同角度/位置，至少 8 张）生成
 `code/ready_code/camera_calib.npz`，之后 `v1.2.py` 会自动载入。采集的原图存在 `code/ready_code/calib_shots/`。
@@ -80,12 +90,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   实时规格选型见 `docs/模型性能测试记录.md`（首选 320，≈17FPS）。
 - **踩坑：`ncnn.Mat(numpy)` 只包装不拷贝缓冲区**，预处理数组出作用域会段错误，`yolo_ncnn.py`
   用 `.clone()` 让 Mat 拥有自有内存。
+- **`YoloNcnn.decode()` 支持临时覆盖置信度阈值**（`decode(..., conf_thres=x)`，不传则用
+  `self.conf_thres`），是给 v1.1 的 ByteTrack 式高/低两级关联用的：一次前向，按低阈值解码
+  一次拿到全部候选框，再由 `bot_sort.py` 内部按高/低两级阈值拆分，不用重复推理。
 - **通信格式唯一事实来源是 `code/task_code/protocol.py`。** 帧格式
-  `$BALL,<found>,<x>,<y>,<n>*<CHK>\r\n`（NMEA 风格 ASCII + XOR 校验），主目标=面积最大的球，
+  `$BALL,<found>,<x>,<y>,<n>*<CHK>\r\n`（NMEA 风格 ASCII + XOR 校验），
   坐标是去畸变 640x480 画面像素、原点左上。改格式只改这一处，下位机解析同步。
+  **主目标定义随版本略有差异**：v1.0 每帧独立选面积最大的球；v1.1 起改成"锁定跟踪 id"——
+  只要该轨迹没有真正丢失就一直是同一个目标（漏检/遮挡靠卡尔曼预测续上），
+  轨迹消失了才按面积最大重新挑，避免逐帧选最大导致的目标跳变。
+- **v1.1 起加入目标跟踪，保证框选连续性**：`code/task_code/bot_sort.py` 实现
+  BoT-SORT 的无 ReID 版本（ByteTrack 两级关联 + 相机运动补偿 GMC + 用 (cx,cy,w,h)
+  建模的卡尔曼滤波），`code/task_code/one_euro_filter.py` 对跟踪后的主目标坐标做最后
+  一道平滑再发串口。ReID（外观特征）按要求关闭：单类球没有可辨识外观，且树莓派5
+  跑 ReID 网络划不来；本机也没装 scipy/lap/ultralytics，所以匈牙利分配和卡尔曼滤波
+  都是纯 numpy 手写，不是套的库。写新的多目标跟踪场景可复用 `bot_sort.BotSort`。
 - **热插拔封装：`serial_link.py` / `camera_link.py`** 各自把"找设备/等设备/断线重连"收在一处，
   串口锁定固定物理 USB 口（`/dev/serial/by-path/...`，换口改 `PREFERRED_BYPATH`），
-  摄像头掉线时 `v1.0.py` 显示占位画面、插回自动续，两条链路都不因拔插崩溃。写新任务脚本复用它们。
+  摄像头掉线时 `v1.0.py`/`v1.1.py` 显示占位画面、插回自动续，两条链路都不因拔插崩溃。
+  写新任务脚本复用它们。
 
 ## 硬件约束（决定了代码为什么这么写）
 

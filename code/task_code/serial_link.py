@@ -143,6 +143,29 @@ class SerialLink:
             self._drop()
             raise Disconnected()
 
+    def read_available_nonblocking(self):
+        """
+        非阻塞版：只取此刻 OS 缓冲里已有的字节，没有就立刻返回 b""，绝不等超时。
+        设备被拔出抛 Disconnected。
+
+        为什么单独加一个：read_available() 在无数据时会 self.ser.read(1) 阻塞一个 timeout
+        （0.2s），对【每帧都要 poll 一次串口】的实时循环（如视觉主循环）是致命的——下位机
+        不是一直在发数据，大多数帧 in_waiting==0，于是每帧白等最多 0.2s，把整个循环（连同
+        串口发坐标的频率）拖到个位数 Hz。实测单次 read_available() 均值 ~117ms。实时循环改
+        用这个方法后，无数据帧几乎零耗时。serial_test.py 那种专门的收包循环仍用会阻塞的
+        read_available()（靠它的 timeout 天然限速、不空转），故本方法【新增】而不改旧的。
+        """
+        if self.ser is None:
+            raise Disconnected()
+        try:
+            n = self.ser.in_waiting
+            if n <= 0:
+                return b""
+            return self.ser.read(n)
+        except (serial.SerialException, OSError, TypeError):
+            self._drop()
+            raise Disconnected()
+
     def write(self, data):
         """写数据；设备被拔出抛 Disconnected。"""
         if self.ser is None:

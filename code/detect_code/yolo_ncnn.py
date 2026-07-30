@@ -106,14 +106,17 @@ class YoloNcnn:
             _, out0 = ex.extract("out0")
             return np.array(out0).copy()
 
-    def decode(self, out, scale, left, top, orig_w, orig_h):
+    def decode(self, out, scale, left, top, orig_w, orig_h, conf_thres=None):
         """
         out: (5, N)，把满足阈值的框解码 + NMS + 反 letterbox 到原图坐标。
+        conf_thres: 不传则用 self.conf_thres；传入可临时覆盖（供 v1.1 的
+        ByteTrack 式高/低两级关联传一个更低的阈值，一次前向、两级取用，不用重复推理）。
         返回 list[(x1, y1, x2, y2, conf)]（int 坐标）。
         """
+        conf_thres = self.conf_thres if conf_thres is None else conf_thres
         out = out.T  # (N, 5)
         conf = out[:, 4]
-        keep = conf >= self.conf_thres
+        keep = conf >= conf_thres
         out, conf = out[keep], conf[keep]
         if out.shape[0] == 0:
             return []
@@ -127,7 +130,7 @@ class YoloNcnn:
 
         boxes = np.stack([x1, y1, x2 - x1, y2 - y1], axis=1)  # xywh for NMS
         idxs = cv2.dnn.NMSBoxes(
-            boxes.tolist(), conf.tolist(), self.conf_thres, self.iou_thres
+            boxes.tolist(), conf.tolist(), conf_thres, self.iou_thres
         )
         if len(idxs) == 0:
             return []

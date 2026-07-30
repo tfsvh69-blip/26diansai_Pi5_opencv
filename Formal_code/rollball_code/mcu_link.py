@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""
+单片机通信状态机 —— 握手(PING/PONG) + 题目录像(TASK START/STOP -> ACK) + 钢珠 X 坐标持续发送
+环境: /home/hao/vision_env/bin/python3（需 pyserial + opencv，vision_env 都有）
+
+对应文档: Formal_code/通信协议/单片机树莓派通信协议.md
+被 v1.1_beta.py import 使用，不单独运行。
+
+串口热插拔连接管理直接复用 code/task_code/serial_link.py 的 SerialLink（找口/等口/
+断线重连不重写），本模块只负责帧收发节奏和 START/STOP/录像/PONG 这套状态机。
+"""
+
+import os
+import queue
+import threading
+import time
+from datetime import datetime
+
+import cv2
+
+import mcu_protocol
+from serial_link import SerialLink, Disconnected  # 由调用方(v1.1_beta.py)先插好 sys.path
+
+
+class _VideoRecorder:
+    """
+    后台写盘线程 + 有界队列：把 mp4 编码(cv2.VideoWriter.write)从主循环搬到独立线程，
+    录像时不再拖低"采集+检测+发串口"的主循环帧率（保留录像功能又尽量不掉帧）。
+    VideoWriter 由本线程【独占】创建/写/释放（OpenCV VideoWriter 非线程安全，绝不让
+    主线程碰 writer 对象），主线程只通过队列递交帧和控制消息。
+
+    生命周期：McuLink 构造时起一个常驻 daemon 线程；每次 TASK 录像：
+        open(w,h,fps,task_id)  ->  submit(frame) * N  ->  close()
+    open/submit/close 都【非阻塞】，不卡主循环；close() 只入队一个哨兵，worker 把队列里
+    剩余帧写完再 release + 落盘打印。McuLink.close() 调 stop() 停线程并 join(超时兜底)。
+
+    队列【有界】：满了就丢帧 + 计数告警（宁可丢也绝不阻塞主循环）。正常负载下
+    mp4v@640x480 在树莓派5 跟得上、队列近空、不丢帧；只有编码短暂跟不上才会丢。
+    """
+
+    def __init__(self, video_dir, fallback_fps=30, maxsize=60, log=print):
+        self.video_dir = video_dir
+        self.fallback_fps = fallback_fps
+        self.log = log
+        self._q = queue.Queue(maxsize=maxsize)
+        self._dropped = 0
+        self._last_drop_log = 0.0
+        self._alive = True
+        self._thread = threading.Thread(target=self._run, name="video-writer", daemon=True)
+        self._thread.start()
+
+    # -------------------- 主线程侧 API（全部非阻塞） --------------------
+
+    def open(self, w, h, fps, task_id):
+        """开一段新录像（真正建 writer 在 worker 线程做，需帧尺寸 + 实测 fps）。"""
+        self._put(("open", int(w), int(h), float(fps) if fps else 0.0, task_id))
+
+    def submit(self, frame):
+        """递交一帧【干净】画面；队列满则丢帧 + 计数（不阻塞主循环）。"""
+        try:
+            self._q.put_nowait(("frame", frame))
+        except queue.Full:
+            self._dropped += 1
+            now = time.time()
+            if now - self._last_drop_log >= 1.0:  # 丢帧告警限流，别刷屏
+                self._last_drop_log = now
+                self.log(f"⚠️ 录像写盘跟不上，累计丢弃 {self._dropped} 帧（编码速度 < 采集速度）。")
+
+    def close(self):
+        """结束当前这段录像：入队关闭哨兵，worker 写完剩余帧后 release + 落盘。"""
+        self._put(("close",))
+
+    def stop(self, join_timeout=3.0):
+        """停后台线程（退出时调），先兜底关掉可能还开着的 writer 再 join。"""
+        if not self._alive:
+            return
+        self._alive = False
+        self._put(("quit",))
+        self._thread.join(timeout=join_timeout)
+
+    def _put(self, item):
+        # 控制类消息(open/close/quit)很少，尽量别丢；满了阻塞一小会儿（不会真卡住主循环）。
+        try:
+            self._q.put(item, timeout=1.0)
+        except queue.Full:
+            self.log("⚠️ 录像控制消息入队超时，已忽略。")
+
+    # -------------------------- worker 线程侧 --------------------------
+
+    def _run(self):
+        writer = None
+        rec_path = None
+        task_id = None
+        while True:
+            item = self._q.get()
+            kind = item[0]
+            if kind == "frame":
+                if writer is not None:
+                    frame = item[1]
+                    # 水印画在【自己的 copy】上，不动主线程递交进来的共享帧（那帧主线程还可能
+                    # 拿去画 MJPEG 叠加层）；这份 copy 在 worker 线程做，不占主循环时间。
+                    rec = frame.copy()
+                    cv2.putText(rec, f"TASK {task_id}", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
+                    writer.write(rec)
+            elif kind == "open":
+                if writer is not None:  # 异常路径：上一段没正常 close 就来了新 open，先兜底关
+                    writer.release()
+                    self.log(f"💾 录像已保存 → {rec_path}")
+                    writer, rec_path = None, None
+                _, w, h, fps, task_id = item
+                writer, rec_path = self._open_writer(w, h, fps, task_id)
+            elif kind == "close":
+                if writer is not None:
+                    writer.release()
+                    self.log(f"💾 录像已保存 → {rec_path}")
+                    writer, rec_path = None, None
+            elif kind == "quit":
+                if writer is not None:
+                    writer.release()
+                    self.log(f"💾 录像已保存 → {rec_path}")
+                break
+
+    def _open_writer(self, w, h, fps, task_id):
+        os.makedirs(self.video_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(self.video_dir, f"{stamp}.mp4")
+        # 用【主循环实测帧率】建 writer（夹到合理区间）：固定 60 的头去封装 ~十几fps 采到的
+        # 帧，会让 5s 录像被压成 ~1s；用真实帧率封装，播放时长才和实际一致。无效值回退默认。
+        use_fps = fps if (fps and fps > 0) else self.fallback_fps
+        use_fps = max(1.0, min(float(use_fps), 120.0))
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(path, fourcc, use_fps, (int(w), int(h)))
+        if not writer.isOpened():
+            self.log(f"❌ 无法创建录像文件 {path}（mp4v 编码不可用？）")
+            return None, None
+        self.log(f"🎥 开始录像 → {path}（TASK {task_id}, {use_fps:.1f}fps）")
+        return writer, path
+
+
+class McuLink:
+    """
+    用法（主循环每帧调用）：
+        mcu = McuLink(video_dir=..., video_fps=60, port=args.mcu_port)
+        mcu.try_open()                 # 非阻塞，不卡视觉启动
+        ...初始化完相机/检测/显示后...
+        mcu.ready = True               # 协议要求：这之后才回 PONG
+        while True:
+            mcu.try_open()
+            mcu.poll_incoming()        # 处理 PING/TASK，自动回 PONG/ACK
+            mcu.send_x(x_px_or_None)   # 按协议节流发 $X / $X,NA
+            # 每帧都调用！方法内部按需判断要不要写；measured_fps 传主循环实测帧率(fps_ema)，
+            # 让录像文件用真实帧率封装、播放时长与实际一致。写盘在后台线程，不拖慢本循环。
+            mcu.write_video_frame(clean_frame, measured_fps=fps_ema)
+        mcu.close()                    # 退出时停后台写盘线程(兜底 release) + 关串口
+    """
+
+    def __init__(self, video_dir, video_fps=30, port=None, any_ok=True, log=print):
+        self.link = SerialLink(port=port, any_ok=any_ok, log=log)
+        self.video_dir = video_dir
+        self.video_fps = video_fps
+        self.log = log
+
+        self.buf = bytearray()
+        self.ready = False  # 相机/识别/显示/录像都初始化完成后才置 True，才回 PONG
+        self.last_ping_t = 0.0
+
+        self.current_run_id = None
+        self.current_task_id = None
+        # 录像写盘搬到后台线程（见 _VideoRecorder）。writer 归后台线程独占，主线程这边只留
+        # 一个"是否正在录"的标志 + "该开新文件了"的标志；fallback_fps 用 video_fps。
+        self._recorder = _VideoRecorder(video_dir, fallback_fps=video_fps, log=log)
+        self._rec_active = False   # 主线程视角：当前是否处于一段录像中（START~STOP）
+        self._pending_open = False  # 收到 START 后置真，第一帧到了才真正开文件（要帧尺寸）
+
+        self.lost = True
+        self._last_x_tx = 0.0
+        self._last_na_tx = 0.0
+        self.tx_x_count = 0
+        self._tx_print_last = {}  # 按 throttle_key 记录上次打印时间，控制高频帧(X)的刷屏
+
+    # ---------------------------- 连接管理（透传） ----------------------------
+
+    @property
+    def connected(self):
+        return self.link.connected
+
+    @property
+    def mcu_online(self):
+        """仅供本地 HUD 展示：3s 内收到过 PING 就认为 MCU 在线（协议里判定视觉离线的镜像逻辑）。"""
+        return self.last_ping_t > 0 and (time.time() - self.last_ping_t) < 3.0
+
+    @property
+    def recording(self):
+        # 主线程视角的"是否正在录"标志（真正的 writer 归后台线程独占，这里不看它）。
+        return self._rec_active
+
+    def try_open(self, min_interval=1.0):
+        return self.link.try_open(min_interval)
+
+    def wait_and_open(self, poll=0.5):
+        self.link.wait_and_open(poll)
+
+    # ------------------------------- 接收解析 -------------------------------
+
+    def poll_incoming(self):
+        """非阻塞读一次串口，切帧解析并分发处理；主循环每帧调一次。"""
+        if not self.link.connected:
+            return
+        try:
+            # 非阻塞：无数据立即返回，避免每帧白等一个串口 timeout(0.2s) 把视觉主循环
+            # （连同发坐标频率）拖到个位数 Hz。见 serial_link.read_available_nonblocking。
+            data = self.link.read_available_nonblocking()
+        except Disconnected:
+            return
+        if data:
+            self.buf += data
+        while b"\n" in self.buf:
+            idx = self.buf.index(b"\n")
+            line = bytes(self.buf[:idx])
+            del self.buf[:idx + 1]
+            self._handle_line(line)
+
+    def _handle_line(self, line):
+        parsed = mcu_protocol.parse_frame(line)
+        if parsed is None:
+            self.log(f"← 串口接收(校验失败/无法解析): {line!r}")
+            return
+        msg_type, fields = parsed
+        self.log(f"← 串口接收: {line.decode('ascii', 'replace').strip()}")
+        if msg_type == "PING" and len(fields) == 1:
+            self._on_ping(fields[0])
+        elif msg_type == "TASK" and len(fields) == 3:
+            self._on_task(fields[0], fields[1], fields[2])
+
+    def _write(self, frame_bytes, log_always=True, throttle_key=None, throttle_interval=0.0):
+        """
+        写串口 + 打印，供 _on_ping/_send_ack/send_x 复用。
+        log_always=False 时按 throttle_key 限流【打印】（不影响实际发送节奏），
+        用于 $X 这种最高 60Hz 的高频帧，避免刷屏。
+        返回是否真的写成功，供调用方决定要不要计数（保持和之前 try/except 一致的行为）。
+        """
+        try:
+            self.link.write(frame_bytes)
+        except Disconnected:
+            return False
+        text = frame_bytes.decode().strip()
+        if log_always:
+            self.log(f"→ 串口发送: {text}")
+        else:
+            now = time.time()
+            if now - self._tx_print_last.get(throttle_key, 0.0) >= throttle_interval:
+                self._tx_print_last[throttle_key] = now
+                self.log(f"→ 串口发送: {text}")
+        return True
+
+    def _on_ping(self, ping_id):
+        self.last_ping_t = time.time()
+        if not self.ready:
+            return  # 视觉还没初始化完成，按协议不回 PONG（MCU 会按 500ms 继续重发）
+        self._write(mcu_protocol.build_pong_frame(ping_id))
+
+    def _on_task(self, run_id, task_id, phase):
+        if phase == "START":
+            self._start_task(run_id, task_id)
+        elif phase == "STOP":
+            self._stop_task(run_id, task_id)
+
+    def _start_task(self, run_id, task_id):
+        if self.current_run_id == run_id and self._rec_active:
+            # 同一 run_id 的重复 START：不重复创建录像文件，只重复回 ACK
+            self._send_ack(run_id, task_id, "START")
+            return
+        if self._rec_active:
+            self.log(f"⚠️ 收到新 run_id={run_id} 的 START，但仍在录 run_id={self.current_run_id}，先关闭旧文件。")
+            self._recorder.close()
+        self.current_run_id = run_id
+        self.current_task_id = task_id
+        self._rec_active = True
+        self._pending_open = True  # 真正建文件延后到拿到帧尺寸的 write_video_frame()
+        self._send_ack(run_id, task_id, "START")
+
+    def _stop_task(self, run_id, task_id):
+        if self._rec_active:
+            self._recorder.close()  # 非阻塞：后台线程写完队列里剩余帧再 release + 落盘打印
+        self._rec_active = False
+        self._pending_open = False
+        self._send_ack(run_id, task_id, "STOP")
+
+    def _send_ack(self, run_id, task_id, phase):
+        self._write(mcu_protocol.build_ack_frame(run_id, task_id, phase))
+
+    # -------------------------------- 录像 --------------------------------
+
+    def write_video_frame(self, frame, measured_fps=None):
+        """
+        主循环【每帧无条件调用】，传去畸变后的【干净】画面（不要传叠了调参可视化的那份）。
+        measured_fps：主循环实测端到端帧率(fps_ema)，第一帧建 writer 时用来当录像帧率，
+        让播放时长与实际一致（不传/无效则回退构造时的 video_fps）。
+
+        实际写盘在【后台线程】(_VideoRecorder)：本方法只把帧【非阻塞入队】，几乎不占主循环
+        时间，录像时也不拖低采集/检测/发串口的帧率。水印由后台线程画在自己的副本上。
+
+        【踩坑，实测复现过】调用方不能用 `if mcu.recording: mcu.write_video_frame(frame)`
+        包一层——START 后只置了标志，真正开文件要等本方法拿到第一帧的尺寸才做；早期
+        `recording` 曾定义成 `writer is not None`，包一层会导致 writer 永远建不起来、录像
+        文件永远不生成（握手却看似正常）。现在 `recording` 看主线程标志、本方法内部自带判断，
+        调用方直接每帧调用即可，不要在外面再加 `if mcu.recording` 门槛。
+        """
+        if not self._rec_active:
+            return
+        if self._pending_open:
+            # 第一帧到了才真正开文件（此刻才知道帧尺寸，且 fps_ema 已收敛可用）
+            self._recorder.open(frame.shape[1], frame.shape[0], measured_fps, self.current_task_id)
+            self._pending_open = False
+        self._recorder.submit(frame)
+
+    # ------------------------------ X 坐标发送 ------------------------------
+
+    def send_x(self, x_val):
+        """
+        x_val: 当前帧检测到的主目标 x 坐标（int），None=丢球。
+        有效坐标：【每读到一帧有效数据就立即发一次】，不做频率节流——发送快慢直接由视觉
+        主循环的帧率决定（尽快发）。协议 §6 的 30~60Hz 只是"建议范围"，主循环本来就在这
+        区间内，无需再人为限速。NA(丢球)：刚丢立即发一次，持续丢球每 200ms 一次（§7）。
+        注：本项目当前发的是【全画面绝对像素 x】，不是协议定义的 mm——摆杆两端像素->毫米
+        标定还没做，等标定好了只需把调用方传进来的 x_val 换成换算后的 mm 值，本方法不用改。
+        """
+        now = time.time()
+        if x_val is not None:
+            self.lost = False
+            # 打印限流(0.3s)，只是别刷屏；发送本身每帧都发，不受打印限流影响。
+            ok = self._write(mcu_protocol.build_x_frame(int(x_val)),
+                              log_always=False, throttle_key="x", throttle_interval=0.3)
+            if ok:
+                self._last_x_tx = now
+                self.tx_x_count += 1
+        else:
+            just_lost = not self.lost
+            self.lost = True
+            if just_lost or (now - self._last_na_tx) >= 0.2:
+                if self._write(mcu_protocol.build_x_na_frame()):
+                    self._last_na_tx = now
+
+    # --------------------------------- 收尾 ---------------------------------
+
+    def close(self):
+        self._recorder.stop()  # 停后台写盘线程，兜底 release 掉可能还开着的录像文件
+        self.link.close()

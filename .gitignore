@@ -9,5 +9,14 @@ code/ready_code/calib_shots/
 # 数据采集录制的视频（体积大，属数据不属代码，不入库）
 code/record_code/output/
 
+# 滚球题目按 TASK START/STOP 录制的比赛视频（体积大，属运行产物不属代码，不入库）
+Formal_code/rollball_code/recordings/
+Formal_code/mp4/
+
 # 任务运行时的本机配置（用户在本机调出的规格/去畸变/阈值，属本机状态，不入库）
 code/task_code/task_config.json
+code/opencv_code/detector_config.json
+Formal_code/rollball_code/rollball_config.json
+
+# 反馈截图（贴问题用，本机临时文件，不入库）
+反馈AI图片/
