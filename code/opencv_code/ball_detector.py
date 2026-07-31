@@ -64,10 +64,15 @@ class BallDetector:
         self.max_radius = 22
         self.blur_ksize = 5
 
-        # === 金属确认参数（已融入多因素评分，不再是硬否决）===
+        # === 金属确认参数 ===
         self.hi_v = 160           # "最亮"阈值（高光分用到）
-        self.min_vmax = 100       # 亮度分用到，不单独否决
-        self.min_vstd = 5         # 对比度分用到，不单独否决
+        self.min_vmax = 100       # 硬门槛：候选区域最大亮度低于此值直接拒绝(排除暗淡假阳性)
+        self.min_vstd = 5         # 硬门槛：候选区域亮度标准差(对比度)低于此值直接拒绝(排除平坦假阳性)
+
+        # === 球体轮廓阈值（比 hi_v 低很多，圈出整个球体而非只有高光点）===
+        # 用于主目标的亚像素质心细化 + 二值化调试/网页窗口显示，不参与 _score() 打分。
+        # 默认值是起点，需要现场对着实体钢珠用滑块调（各环境光照/球面反光程度不同）。
+        self.body_v = 50
 
         # === NMS ===
         self.nms_iou = 0.35
@@ -87,12 +92,17 @@ class BallDetector:
         # === 输出平滑 ===
         self.ema_alpha = 0.3
 
+        # 主目标最近一次的球体轮廓掩膜（整幅画面尺寸，球=255/背景=0），给调试窗口/网页
+        # 二值化预览用，不参与检测逻辑；不受 reset() 影响，只在 detect() 里被覆盖更新。
+        # 没有主目标或细化失败时是 None。
+        self.last_mask_full = None
+
         # === 运行状态（不持久化）===
         self.reset()
 
     TUNABLE = (
         "param1", "param2", "min_radius", "max_radius", "blur_ksize",
-        "hi_v", "min_vmax", "min_vstd",
+        "hi_v", "min_vmax", "min_vstd", "body_v",
         "nms_iou",
         "track_max_dist", "match_dist_factor", "vel_alpha", "vel_decay",
         "conf_inc", "conf_dec",
@@ -118,6 +128,64 @@ class BallDetector:
         self._vy = 0.0         # 速度 y
         self._confidence = 0.0
         self._smoothed = None
+
+    # ---- 主目标球体轮廓质心细化 ----
+
+    def _refine_center(self, hsv, x, y, r):
+        """
+        在 Hough 给出的 (x,y,r) 附近做一次局部二值化+质心细化，得到更稳的亚像素圆心。
+
+        Hough 的圆心直接被上游 int 化，量化噪声会让静止目标在相邻帧的整数坐标间跳动；
+        这里改用"局部阈值分割出整个球体轮廓 + 图像矩算加权质心"，比单次 Hough 投票更
+        抗噪声，还顺带产出一张完整的球体二值掩膜供调试/网页窗口显示。
+
+        返回 (cx_f, cy_f, mask_patch, (x0,y0)) 或 None（细化失败，调用方回退用原始
+        Hough 坐标，不影响现有正确性）。mask_patch 是 uint8 0/255 局部掩膜，(x0,y0) 是
+        它左上角在整幅画面里的偏移，供拼回整幅画布。
+        """
+        H, W = hsv.shape[:2]
+        half = max(int(round(r * 1.6)), 4)
+        x0 = max(0, x - half)
+        x1 = min(W, x + half)
+        y0 = max(0, y - half)
+        y1 = min(H, y + half)
+        if x1 - x0 < 6 or y1 - y0 < 6:
+            return None
+
+        V = hsv[y0:y1, x0:x1, 2]
+        _, mask = cv2.threshold(V, self.body_v, 255, cv2.THRESH_BINARY)
+        mask = mask.astype(np.uint8)
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        num, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if num <= 1:
+            return None  # 全黑，没有前景
+
+        # 只保留离 Hough 圆心最近的连通域（排除背景杂散高光/噪声误入）
+        cxl, cyl = x - x0, y - y0
+        best_lbl, best_dist = None, None
+        for lbl in range(1, num):
+            dx = centroids[lbl][0] - cxl
+            dy = centroids[lbl][1] - cyl
+            dist = dx * dx + dy * dy
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_lbl = lbl
+
+        area = stats[best_lbl, cv2.CC_STAT_AREA]
+        expected = np.pi * r * r
+        if area < 0.3 * expected or area > 3.0 * expected:
+            return None  # 面积明显不像一个球，细化不可信
+
+        comp_mask = np.where(labels == best_lbl, 255, 0).astype(np.uint8)
+        m = cv2.moments(comp_mask, binaryImage=True)
+        if m["m00"] <= 0:
+            return None
+
+        cx_f = x0 + m["m10"] / m["m00"]
+        cy_f = y0 + m["m01"] / m["m00"]
+        return cx_f, cy_f, comp_mask, (x0, y0)
 
     # ---- 内部打分 ----
 
@@ -151,8 +219,11 @@ class BallDetector:
         vmax = float(vin.max())
         vstd = float(vin.std())
 
-        # === 硬否决：完全没有内部变化 + 亮度极低 → 不是钢珠 ===
-        if vstd < 3.0 and vmax < 80:
+        # === 硬否决：不够亮 或 不够有对比度 → 不是钢珠 ===
+        # min_vmax/min_vstd 两个独立下限，任一没达标就直接拒绝（原来是"两者都极低才拒绝"
+        # 的弱组合条件，几乎挡不住背景纹理/反光凑出来的假阳性候选，导致 Hough 到处乱报圆时
+        # 打分照样能通过、框到处跳。现在接成真正的硬门槛，配合 hi_v/body_v 用滑条现场调。
+        if vmax < self.min_vmax or vstd < self.min_vstd:
             return -1.0
 
         # ===== 1) 亮度分 (0~30) =====
@@ -235,6 +306,19 @@ class BallDetector:
             best = dedup[0]  # 评分最高
             bx, by, br = best[0], best[1], best[2]
 
+            # 对主目标做局部球体轮廓质心细化：比原始 Hough 整数圆心更抗噪声，顺带产出
+            # 完整球体二值掩膜供调试/网页窗口显示。细化失败就原样保留 Hough 坐标。
+            refined = self._refine_center(hsv, bx, by, br)
+            if refined is not None:
+                cx_f, cy_f, mask_patch, (mx0, my0) = refined
+                bx, by = int(round(cx_f)), int(round(cy_f))
+                full = np.zeros(hsv.shape[:2], dtype=np.uint8)
+                full[my0:my0 + mask_patch.shape[0], mx0:mx0 + mask_patch.shape[1]] = mask_patch
+                self.last_mask_full = full
+                dedup[0] = (bx, by, br, best[3])
+            else:
+                self.last_mask_full = None
+
             # 更新速度
             if self._px is not None and self._py is not None:
                 self._vx = (1.0 - self.vel_alpha) * self._vx \
@@ -253,6 +337,9 @@ class BallDetector:
             return dedup
 
         # ===== 情况 B：无检测 → 用跟踪预测 =====
+        # 本帧没有真实检测，之前那张球体掩膜不再对应当前画面，清掉避免调试/网页窗口
+        # 显示一张过时位置的白色轮廓。
+        self.last_mask_full = None
         if self._px is not None and self._confidence > 0:
             # 按速度惯性前推
             self._px += self._vx

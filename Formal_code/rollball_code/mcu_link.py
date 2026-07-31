@@ -36,7 +36,22 @@ class _VideoRecorder:
 
     队列【有界】：满了就丢帧 + 计数告警（宁可丢也绝不阻塞主循环）。正常负载下
     mp4v@640x480 在树莓派5 跟得上、队列近空、不丢帧；只有编码短暂跟不上才会丢。
+
+    【录像倍速偏快的修复：预热测真实 fps，而不是直接用调用方传的瞬时值】
+    open() 传入的 fps 只是"这一刻"的主循环 EMA 快照，实测发现它有时会明显偏高于这段
+    录像自己实际能达到的帧率（比如相机 SDK 内部缓冲短暂"连续秒读"把 EMA 拉高），拿这个
+    偏高值去建 VideoWriter，会导致 帧数/fps 算出的播放时长比真实经过时间短、看起来倍速。
+    改法：收到 open() 后先不建 writer，进入"预热"状态，把最先来的一批帧(连同各自到达
+    时间)缓冲在内存里(不丢、不写盘)，攒够 WARMUP_MIN_FRAMES 帧且经过 WARMUP_MIN_TIME
+    (或达到 WARMUP_MAX_FRAMES 兜底上限)后，用这批帧自己的时间戳算出
+    real_fps=(帧数-1)/(首尾时间差)，再真正建 writer、把缓冲的帧一次性冲下去、之后转入
+    正常"收到就写"。STOP 如果在预热完成前就到了(录像很短)，就用已收集到的帧提前收尾。
+    代价：每段录像开头有 ≤WARMUP_MIN_TIME 秒的决策延迟，但帧全部保留在缓冲区，不丢。
     """
+
+    WARMUP_MIN_FRAMES = 15   # 至少攒这么多帧才够算一个靠谱的 real_fps
+    WARMUP_MIN_TIME = 0.5    # 且至少经过这么久（帧数够但间隔极短也不算数）
+    WARMUP_MAX_FRAMES = 60   # 兜底上限：极端情况下也不能无限攒下去不开始写
 
     def __init__(self, video_dir, fallback_fps=30, maxsize=60, log=print):
         self.video_dir = video_dir
@@ -52,7 +67,11 @@ class _VideoRecorder:
     # -------------------- 主线程侧 API（全部非阻塞） --------------------
 
     def open(self, w, h, fps, task_id):
-        """开一段新录像（真正建 writer 在 worker 线程做，需帧尺寸 + 实测 fps）。"""
+        """
+        开一段新录像（真正建 writer 延后到 worker 线程预热完成，见类文档"倍速偏快的修复"）。
+        fps 这个参数现在只是个提示值，实际封装用的 fps 由 worker 自己预热这段录像的真实
+        帧间隔算出来，传 0/None 也没关系。
+        """
         self._put(("open", int(w), int(h), float(fps) if fps else 0.0, task_id))
 
     def submit(self, frame):
@@ -91,42 +110,99 @@ class _VideoRecorder:
         writer = None
         rec_path = None
         task_id = None
+        state = "idle"        # idle / warming(攒帧算真实fps) / open(writer已建好)
+        warmup = []            # [(frame, t_perf_counter), ...]，只在 warming 态使用
+        pending_wh = None      # (w, h)，warming 态建 writer 时要用
         while True:
             item = self._q.get()
             kind = item[0]
+
             if kind == "frame":
-                if writer is not None:
-                    frame = item[1]
-                    # 水印画在【自己的 copy】上，不动主线程递交进来的共享帧（那帧主线程还可能
-                    # 拿去画 MJPEG 叠加层）；这份 copy 在 worker 线程做，不占主循环时间。
-                    rec = frame.copy()
-                    cv2.putText(rec, f"TASK {task_id}", (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
-                    writer.write(rec)
+                frame = item[1]
+                if state == "open" and writer is not None:
+                    writer.write(self._watermark(frame, task_id))
+                elif state == "warming":
+                    # 预热阶段要把帧攒住等一小段时间才写，跟"open"态里帧一到就立即写掉不同，
+                    # 必须 .copy()——不然如果上游相机/主线程复用同一块缓冲区，攒着的这些帧
+                    # 会在真正写盘前被后面的帧数据覆盖掉。
+                    warmup.append((frame.copy(), time.perf_counter()))
+                    elapsed = warmup[-1][1] - warmup[0][1]
+                    ready = (len(warmup) >= self.WARMUP_MIN_FRAMES and elapsed >= self.WARMUP_MIN_TIME) \
+                        or len(warmup) >= self.WARMUP_MAX_FRAMES
+                    if ready:
+                        writer, rec_path = self._finish_warmup(warmup, pending_wh, task_id)
+                        warmup = []
+                        state = "open" if writer is not None else "idle"
+
             elif kind == "open":
-                if writer is not None:  # 异常路径：上一段没正常 close 就来了新 open，先兜底关
-                    writer.release()
-                    self.log(f"💾 录像已保存 → {rec_path}")
-                    writer, rec_path = None, None
-                _, w, h, fps, task_id = item
-                writer, rec_path = self._open_writer(w, h, fps, task_id)
-            elif kind == "close":
+                # 异常路径：上一段没正常 close 就来了新 open（无论上一段是"已建 writer"还是
+                # 还在"预热"），先把它当作要结束的一段收尾，避免帧丢在半空或 writer 泄漏。
+                if state == "warming" and warmup:
+                    w0, rp0 = self._finish_warmup(warmup, pending_wh, task_id)
+                    if w0 is not None:
+                        w0.release()
+                        self.log(f"💾 录像已保存 → {rp0}")
+                    warmup = []
                 if writer is not None:
                     writer.release()
                     self.log(f"💾 录像已保存 → {rec_path}")
-                    writer, rec_path = None, None
+                writer, rec_path = None, None
+                _, w, h, _fps_hint, task_id = item
+                pending_wh = (w, h)
+                state = "warming"
+
+            elif kind == "close":
+                if state == "warming":
+                    writer, rec_path = self._finish_warmup(warmup, pending_wh, task_id)
+                    warmup = []
+                if writer is not None:
+                    writer.release()
+                    self.log(f"💾 录像已保存 → {rec_path}")
+                writer, rec_path = None, None
+                state = "idle"
+
             elif kind == "quit":
+                if state == "warming":
+                    writer, rec_path = self._finish_warmup(warmup, pending_wh, task_id)
+                    warmup = []
                 if writer is not None:
                     writer.release()
                     self.log(f"💾 录像已保存 → {rec_path}")
                 break
 
+    def _watermark(self, frame, task_id):
+        # 水印画在【自己的 copy】上，不动主线程递交进来的共享帧（那帧主线程还可能拿去画
+        # MJPEG 叠加层）；这份 copy 在 worker 线程做，不占主循环时间。
+        rec = frame.copy()
+        cv2.putText(rec, f"TASK {task_id}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
+        return rec
+
+    def _finish_warmup(self, warmup, wh, task_id):
+        """
+        预热结束（攒够/STOP提前来）：用缓冲帧自己的时间戳算出这段录像的真实 fps，
+        建 writer，把缓冲帧按顺序一次性冲下去。不足 2 帧算不出间隔，退回 fallback_fps。
+        """
+        if not warmup:
+            return None, None
+        w, h = wh
+        if len(warmup) >= 2:
+            elapsed = warmup[-1][1] - warmup[0][1]
+            real_fps = (len(warmup) - 1) / elapsed if elapsed > 0 else self.fallback_fps
+        else:
+            real_fps = self.fallback_fps
+        writer, rec_path = self._open_writer(w, h, real_fps, task_id)
+        if writer is not None:
+            for frame, _t in warmup:
+                writer.write(self._watermark(frame, task_id))
+        return writer, rec_path
+
     def _open_writer(self, w, h, fps, task_id):
         os.makedirs(self.video_dir, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = os.path.join(self.video_dir, f"{stamp}.mp4")
-        # 用【主循环实测帧率】建 writer（夹到合理区间）：固定 60 的头去封装 ~十几fps 采到的
-        # 帧，会让 5s 录像被压成 ~1s；用真实帧率封装，播放时长才和实际一致。无效值回退默认。
+        # fps 是这段录像自己预热实测出的真实帧率（夹到合理区间）：固定/瞬时偏高的值去封装
+        # 实际采到的帧，会让录像时长被压短；用真实帧率封装，播放时长才和实际一致。
         use_fps = fps if (fps and fps > 0) else self.fallback_fps
         use_fps = max(1.0, min(float(use_fps), 120.0))
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -134,7 +210,7 @@ class _VideoRecorder:
         if not writer.isOpened():
             self.log(f"❌ 无法创建录像文件 {path}（mp4v 编码不可用？）")
             return None, None
-        self.log(f"🎥 开始录像 → {path}（TASK {task_id}, {use_fps:.1f}fps）")
+        self.log(f"🎥 开始录像 → {path}（TASK {task_id}, {use_fps:.1f}fps 实测）")
         return writer, path
 
 
@@ -178,6 +254,9 @@ class McuLink:
         self._last_na_tx = 0.0
         self.tx_x_count = 0
         self._tx_print_last = {}  # 按 throttle_key 记录上次打印时间，控制高频帧(X)的刷屏
+        # 联调已跑通，终端不再刷"→ 串口发送"这行；发送本身（写串口/计数）完全不受影响，
+        # 只是不打印。以后要再核对发送内容，把这个改回 True 即可，不用改别处代码。
+        self.log_tx = False
 
     # ---------------------------- 连接管理（透传） ----------------------------
 
@@ -244,14 +323,15 @@ class McuLink:
             self.link.write(frame_bytes)
         except Disconnected:
             return False
-        text = frame_bytes.decode().strip()
-        if log_always:
-            self.log(f"→ 串口发送: {text}")
-        else:
-            now = time.time()
-            if now - self._tx_print_last.get(throttle_key, 0.0) >= throttle_interval:
-                self._tx_print_last[throttle_key] = now
+        if self.log_tx:
+            text = frame_bytes.decode().strip()
+            if log_always:
                 self.log(f"→ 串口发送: {text}")
+            else:
+                now = time.time()
+                if now - self._tx_print_last.get(throttle_key, 0.0) >= throttle_interval:
+                    self._tx_print_last[throttle_key] = now
+                    self.log(f"→ 串口发送: {text}")
         return True
 
     def _on_ping(self, ping_id):

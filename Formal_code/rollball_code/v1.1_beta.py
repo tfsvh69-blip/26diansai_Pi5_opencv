@@ -109,6 +109,7 @@ _DET_TRACKBARS = [
     ("param2", 100),      # HoughCircles 累加器阈值：越大越严（漏检↑误检↓）
     ("min_vmax", 255),    # 高光/亮度门槛：钢珠高光越暗就调低
     ("hi_v", 255),        # "最亮"阈值(高光分用)
+    ("body_v", 255),      # 球体轮廓阈值(比hi_v低，圈出整个球体，二值化窗口/质心细化用)
     ("min_radius", 40),   # 圆最小半径(px)
     ("max_radius", 60),   # 圆最大半径(px)
 ]
@@ -596,6 +597,64 @@ SLIDER_HELP = [
     "  rs_white_balance  RealSense 白平衡色温(K)",
 ]
 
+# 网页"使用说明"面板的内容——纯 HTML 片段，注入 MjpegServer.doc_html，点"使用说明"按钮
+# 弹出。跟 SLIDER_HELP(打印到终端) 覆盖同一批参数，但写得更详细：每个参数是什么、什么情况
+# 下往哪个方向调。集中写在这里，改参数含义/调参经验时只改这一处，网页/终端不用分别改两份。
+WEB_DOC_HTML = """
+<h3>ROI（感兴趣区域）</h3>
+<p><b>roi_top / roi_bottom / roi_left / roi_right</b> —— 画面里参与检测的矩形范围(像素)，
+外面的区域完全不送进 Hough 圆检测，画面上用黄色框线标出。作用：缩小搜索范围排除管道外的
+干扰圆、加快检测速度。调法：把黄框拖到刚好框住摆杆管道的凹槽区域即可，改完立即生效；
+若管道装配位置变了或摄像头挪动过，需要重新框一次。</p>
+
+<h3>圆检测 (Hough) 参数</h3>
+<p><b>param1</b> —— Canny 边缘检测高阈值。太低会把噪声也当边缘、误检变多；太高会丢失偏弱的
+边缘、导致漏检。一般不用大改，管道内壁反光复杂时可以适当调高排除杂边缘。</p>
+<p><b>param2</b>（Hough严格度） —— 圆心累加器阈值，是最常调的一个：<b>调大</b>=更严格
+(误检↓但漏检↑，球有时会检测不到)；<b>调小</b>=更宽松(漏检↓但误检↑，容易把别的亮斑当成球)。
+球老是丢检，第一个先试着调小这个。</p>
+<p><b>min_radius / max_radius</b> —— 圆半径搜索范围(像素)，要覆盖球在画面里实际呈现的像素
+半径(离镜头越近半径越大)。范围卡得越窄，速度越快、误检越少，但离镜头远近变化大时要留一点
+余量，否则太远/太近的球会因半径超出范围被直接过滤掉。</p>
+<p><b>blur_ksize</b> —— 中值模糊核大小(奇数)，检测前先去噪声。太小噪声压不住导致误检；
+太大会把球的边缘也模糊掉导致漏检，一般 5 附近就够。</p>
+
+<h3>高光/亮度打分参数（决定候选圆的"像不像球"）</h3>
+<p><b>hi_v</b>（最亮阈值） —— 高于这个亮度的像素比例算作"高光分"，钢珠反光越强这个可以设
+高一些、更精准锁定高光点；反光弱/环境暗时调低，否则高光分永远拿不到分。</p>
+<p><b>min_vmax</b>（最低亮度门槛，硬拒绝） —— 候选区域里最大亮度低于这个值就直接判负、
+不管其他因素多好。<b>球一直检测不到，先检查这个是不是设太高了</b>——环境变暗后这个门槛
+没跟着降，会把所有候选都拒掉。</p>
+<p><b>min_vstd</b>（最低对比度门槛，硬拒绝） —— 候选区域亮度标准差(对比度)低于这个值就直接
+判负，用来排除"一片均匀亮度、没有球体轮廓起伏"的假阳性(比如反光板本身)。背景本身很亮很
+均匀、总是误检成球时可以调高这个。</p>
+<p><b>body_v</b>（球体轮廓阈值） —— 比 hi_v 低很多，用来圈出整个球体轮廓(不只是高光点)，
+只用于二值化窗口显示 + 主目标质心细化，不参与候选打分。<b>右边(或网页第二路)的黑白掩膜
+画面就是这个阈值二值化后的效果</b>——白色区域应该正好覆盖整颗球、不多不少：白色区域明显小于
+球体就调低，明显把背景也圈进来了(一片白)就调高。</p>
+
+<h3>NMS（去重）</h3>
+<p><b>nms_iou</b> —— 多个重叠候选圆合并去重的距离阈值(按半径归一化)。调小=去重更激进，
+容易把两个靠得很近的圆错误合并成一个；调大=去重更宽松，容易在同一颗球上保留多个重复候选。
+一般不用大改。</p>
+
+<h3>RealSense 相机成像参数（仅 --source realsense 生效）</h3>
+<p><b>rs_exposure</b>（曝光，微秒） —— <b>全场最关键的一个参数</b>，直接决定画面整体亮度
+和球面高光的强弱。太暗看不清高光、检测不到球；太亮容易过曝，球面高光糊成一片白反而丢失
+形状/对比度信息。<b>换了光照环境(比如换场地、换灯光)，第一个先调这个</b>，配合右侧黑白
+掩膜画面观察球体轮廓是否清晰。</p>
+<p><b>rs_gain</b>（增益） —— 让画面整体变亮，但同时会引入更多噪点。曝光已经调到上限还是
+不够亮时，再考虑加增益；能靠曝光解决就优先调曝光，增益是补充手段。</p>
+<p><b>rs_white_balance</b>（白平衡色温，K） —— 控制画面色调偏冷/偏暖。检测本身只看 HSV
+的 V(亮度)通道，理论上白平衡对检测结果影响很小，主要是让人眼看画面顺眼、颜色不失真；
+画面明显偏黄/偏蓝时调这个。</p>
+
+<h3>关于保存</h3>
+<p>拖动滑块会立即生效（相机/检测器实时应用），并在停止拖动约 1 秒后自动写入配置文件
+(rollball_config.json)，无需手动操作；也可以随时点"调参数"面板里的"保存参数"按钮立即
+落盘。程序下次启动、或摄像头掉线重连时都会自动读取这份配置并重新应用。</p>
+"""
+
 
 def setup_trackbars(cfg, detector, H, W, with_rs):
     cv2.namedWindow(TUNE_WIN, cv2.WINDOW_NORMAL)
@@ -636,13 +695,19 @@ def read_trackbars(cfg, detector, with_rs):
 
 # ============================ 绘制叠加 ============================
 
-def draw_roi_highlight(canvas, top, bottom, left, right):
-    """矩形 ROI 外区域调暗，凸显感兴趣区域，并画四条黄色边界线（上/下/左/右）。"""
+def draw_roi_highlight(canvas, top, bottom, left, right, dim=True):
+    """
+    画四条黄色 ROI 边界线（上/下/左/右）。dim=True 时额外把 ROI 外区域调暗突出重点
+    （本地调参窗口用，习惯了这个效果不改）；dim=False 时画面保持原始真实亮度不处理，
+    只叠黄框做参考（网页主画面用——网页要看到的是"真实画面里球在哪"，调暗了反而看不清
+    ROI 外的实际情况）。
+    """
     H, W = canvas.shape[:2]
-    dim = canvas.astype(np.float32) * 0.35
-    mask = np.ones((H, W), dtype=bool)
-    mask[top:bottom, left:right] = False   # ROI 内不调暗
-    canvas[mask] = dim[mask].astype(np.uint8)
+    if dim:
+        dimmed = canvas.astype(np.float32) * 0.35
+        mask = np.ones((H, W), dtype=bool)
+        mask[top:bottom, left:right] = False   # ROI 内不调暗
+        canvas[mask] = dimmed[mask].astype(np.uint8)
     cv2.line(canvas, (0, top), (W, top), (0, 255, 255), 2, cv2.LINE_AA)
     cv2.line(canvas, (0, min(bottom, H - 1)), (W, min(bottom, H - 1)), (0, 255, 255), 2, cv2.LINE_AA)
     cv2.line(canvas, (left, 0), (left, H), (0, 255, 255), 2, cv2.LINE_AA)
@@ -675,13 +740,14 @@ def draw_hud(canvas, fps, primary, detect_ms=None):
     return canvas
 
 
-def build_detection_overlay(frame, cfg, cands, primary, x0, y0, fps, mcu, detect_ms=None):
+def build_detection_overlay(frame, cfg, cands, primary, x0, y0, fps, mcu, detect_ms=None, dim_roi=True):
     """
-    整幅画面 + ROI 高亮 + 检测结果 + HUD，供【本地 GUI 左图】和【局域网 MJPEG 推流】共用一份，
-    不重复画两次。detect_ms：detector.detect() 单帧耗时(ms)，HUD 上显示，定位帧率瓶颈用。
+    整幅画面 + ROI 高亮 + 检测结果 + HUD。detect_ms：detector.detect() 单帧耗时(ms)，
+    HUD 上显示，定位帧率瓶颈用。dim_roi：透传给 draw_roi_highlight，True=本地 GUI 左图
+    的老样子(ROI 外调暗)，False=网页主画面(真实原始亮度+黄框参考线，不调暗)。
     """
     canvas = frame.copy()
-    draw_roi_highlight(canvas, cfg["roi_top"], cfg["roi_bottom"], cfg["roi_left"], cfg["roi_right"])
+    draw_roi_highlight(canvas, cfg["roi_top"], cfg["roi_bottom"], cfg["roi_left"], cfg["roi_right"], dim=dim_roi)
     draw_detections(canvas, cands, primary, x0, y0)
     draw_hud(canvas, fps, primary, detect_ms)
     if mcu is not None:
@@ -690,6 +756,29 @@ def build_detection_overlay(frame, cfg, cands, primary, x0, y0, fps, mcu, detect
                    f"TXx#{mcu.tx_x_count}")
         cv2.putText(canvas, mcu_hud, (8, 42), cv2.FONT_HERSHEY_SIMPLEX,
                     0.55, (0, 255, 255), 2, cv2.LINE_AA)
+    return canvas
+
+
+def build_ball_mask_overlay(detector, cfg, cands, primary, x0, y0, sub_shape, H, W):
+    """
+    球体二值化掩膜整幅画布：ball_detector.BallDetector._refine_center() 对主目标做局部
+    V 通道阈值(body_v)+闭运算+连通域筛出的完整球体轮廓(球=白/背景=黑)，供【本地 GUI
+    右图】和【局域网 /stream/bin 推流】共用一份，不重复画两次。没有主目标/细化失败时
+    last_mask_full 是 None，画一块纯黑。
+    """
+    if detector.last_mask_full is not None:
+        ball_mask = detector.last_mask_full
+    else:
+        ball_mask = np.zeros(sub_shape, np.uint8)
+    canvas = np.zeros((H, W, 3), np.uint8)
+    canvas[y0:y0 + sub_shape[0], x0:x0 + sub_shape[1]] = cv2.cvtColor(ball_mask, cv2.COLOR_GRAY2BGR)
+    draw_detections(canvas, cands, primary, x0, y0)  # 复用同款绝对坐标画法，圆圈/坐标标签跟左图一致
+    cv2.line(canvas, (0, cfg["roi_top"]), (W, cfg["roi_top"]), (0, 255, 255), 1, cv2.LINE_AA)
+    cv2.line(canvas, (0, cfg["roi_bottom"] - 1), (W, cfg["roi_bottom"] - 1), (0, 255, 255), 1, cv2.LINE_AA)
+    cv2.line(canvas, (cfg["roi_left"], 0), (cfg["roi_left"], H), (0, 255, 255), 1, cv2.LINE_AA)
+    cv2.line(canvas, (cfg["roi_right"] - 1, 0), (cfg["roi_right"] - 1, H), (0, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(canvas, f"BALL MASK (V>body_v={detector.body_v})", (8, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
     return canvas
 
 
@@ -726,6 +815,92 @@ def run_gui(args):
               f"（同一局域网/热点下的手机、电脑浏览器打开即可，摄像头就绪前先显示占位画面）")
     else:
         print("🌐 局域网实时画面: 已禁用 (--no-stream)")
+
+    # 网页参数滑块接线：get/set 直接读写 detector 属性(立即生效)，POST 落地的改动记一个
+    # "脏"时间戳，主循环里距上次改动静默 ≥1s 才真正 save_cfg() 落盘——跟本地按 s 键存盘
+    # 是同一个 save_cfg，只是触发时机换成"滑块停下来 1s"，避免拖动滑块时每次都写文件。
+    params_dirty = {"since": None}
+    # ROI 四个边界 + RealSense 成像三个值都存在 cfg（不是 detector）里，跟检测器参数走
+    # 同一套网页 get/set 接口，_set_param 里按 name 属于哪个集合分流去改 cfg 还是 detector。
+    _ROI_KEYS = {"roi_top", "roi_bottom", "roi_left", "roi_right"}
+    # 只有 realsense 源才有这三个成像选项（曝光/增益/白平衡），USB/CSI 源没有对应硬件接口，
+    # 不摆上网页面板，避免调了也没用。
+    _RS_KEYS = {"rs_exposure", "rs_gain", "rs_white_balance"} if with_rs else set()
+    if stream_server is not None:
+        # 【只列真正对 v1.1_beta.py 这套用法生效的参数】BallDetector.TUNABLE 里还有一批
+        # 跟踪/EMA 相关的参数(track_max_dist/match_dist_factor/vel_alpha/vel_decay/
+        # conf_inc/conf_dec/ema_alpha)——本文件每帧检测完立即 detector.reset()、也从不调
+        # pick_primary()（见主循环里那段"不做时间维度平滑"的注释），这些参数在这套用法下
+        # 根本走不到对应代码分支，摆上滑块调了也不会有任何效果，所以不放进来，以免误导。
+        # 下面这 10 个是 detect()→_score() 真正每帧都会用到的，中间 4 个 ROI 边界决定
+        # Hough 只在画面哪个矩形范围内找圆，最后 3 个是 RealSense 成像固定值（仅 realsense
+        # 源才追加，见 _RS_TRACKBARS 里同样的量程）：
+        stream_server.param_spec = [
+            ("param1", 1, 300, 1, "Canny高阈值"),
+            ("param2", 1, 100, 1, "Hough严格度"),
+            ("min_radius", 1, 60, 1, "最小半径"),
+            ("max_radius", 1, 80, 1, "最大半径"),
+            ("blur_ksize", 1, 15, 2, "中值模糊核"),
+            ("hi_v", 0, 255, 1, "最亮阈值(高光分)"),
+            ("min_vmax", 0, 255, 1, "最低亮度门槛(硬拒绝)"),
+            ("min_vstd", 0, 60, 1, "最低对比度门槛(硬拒绝)"),
+            ("body_v", 0, 255, 1, "球体轮廓阈值"),
+            ("nms_iou", 0.0, 1.0, 0.01, "NMS重叠阈值"),
+            ("roi_top", 0, args.height, 1, "ROI上边界(y)"),
+            ("roi_bottom", 0, args.height, 1, "ROI下边界(y)"),
+            ("roi_left", 0, args.width, 1, "ROI左边界(x)"),
+            ("roi_right", 0, args.width, 1, "ROI右边界(x)"),
+        ] + ([
+            ("rs_exposure", 0, 2000, 1, "曝光(微秒)"),
+            ("rs_gain", 0, 128, 1, "增益"),
+            ("rs_white_balance", 0, 6500, 1, "白平衡色温(K)"),
+        ] if with_rs else [])
+        stream_server.get_params = lambda: {
+            name: (cfg[name] if name in _ROI_KEYS or name in _RS_KEYS else getattr(detector, name))
+            for name, *_ in stream_server.param_spec
+        }
+
+        def _set_param(name, value):
+            if name in _ROI_KEYS:
+                cfg[name] = int(round(value))
+                # 跟本地 ROI 滑条(read_trackbars)一样的最小尺寸保护：网页顺序拖两个边界时
+                # 中间状态可能短暂 top>=bottom 或 left>=right，这里每次都重新校验一遍，
+                # 避免拿一个空/负的 ROI 去裁图把后面的检测搞崩。
+                if cfg["roi_bottom"] <= cfg["roi_top"]:
+                    cfg["roi_bottom"] = cfg["roi_top"] + 10
+                if cfg["roi_right"] <= cfg["roi_left"]:
+                    cfg["roi_right"] = cfg["roi_left"] + 10
+            elif name in _RS_KEYS:
+                # 只落 cfg，不在这里直接下发给相机——主循环每圈都会比较 cfg 与 last_rs
+                # 是否变化、变了才调用 cam.set_color_options()（见主循环那段，gui/headless
+                # 两种模式都会跑到），这里不用重复一份下发逻辑。
+                cfg[name] = int(round(value))
+            else:
+                setattr(detector, name, value)
+            params_dirty["since"] = time.time()
+            # 【踩坑】带 GUI 窗口时，主循环每帧都会用本地 Tuning 滑条(检测器参数+ROI+成像
+            # 都有)的当前位置覆盖回 cfg/detector（见 read_trackbars）——网页这里刚设完，
+            # 下一帧(~30ms后)就被本地滑条的旧值冲掉，网页操作看起来"没生效"。这里把本地
+            # 滑条位置也同步过去，两边就不会互相打架了。headless 模式没有这个窗口、或者
+            # 这个参数没有对应本地滑条(比如 param1/blur_ksize/min_vstd/nms_iou，只在网页
+            # 上暴露)，try/except 兜底忽略。
+            if gui_on:
+                try:
+                    sync_val = cfg[name] if (name in _ROI_KEYS or name in _RS_KEYS) else value
+                    cv2.setTrackbarPos(name, TUNE_WIN, int(round(sync_val)))
+                except cv2.error:
+                    pass
+
+        stream_server.set_param = _set_param
+
+        def _save_now():
+            cfg["detector"] = detector.as_dict()
+            ok = save_cfg(cfg)
+            params_dirty["since"] = None  # 已经落盘，撤销待定的防抖持久化
+            return ok
+
+        stream_server.on_save = _save_now
+        stream_server.doc_html = WEB_DOC_HTML
 
     def camera_factory():
         # 把 cfg 里的成像固定值传给 RealSense（掉线重连也会用这些值重新锁定）。
@@ -784,7 +959,7 @@ def run_gui(args):
 
     frame = undistort_frame(frame, undist_maps, undist_on)
 
-    PANEL_W = W * 2   # 主窗口 = 左:整幅彩色(带高亮+检测) | 右:高光二值掩膜(黑白，调参用)
+    PANEL_W = W * 2   # 主窗口 = 左:整幅彩色(带高亮+检测) | 右:球体二值掩膜(黑白，调参用)
 
     main_win = "RollBall detect (v1.1 beta)"
     if gui_on:
@@ -798,7 +973,7 @@ def run_gui(args):
     fps_ema = 0.0
     detect_ms_ema = 0.0   # 【诊断】detector.detect() 单帧耗时的 EMA(毫秒)，定位 15fps 瓶颈用
     if gui_on:
-        print("   窗口: 主窗口 = [左: 画面+ROI+检测结果(彩色)] | [右: 高光二值掩膜 V>hi_v(黑白，调参用)]")
+        print("   窗口: 主窗口 = [左: 画面+ROI+检测结果(彩色)] | [右: 球体二值掩膜 V>body_v(黑白，调参用)]")
         for _l in SLIDER_HELP:      # 滑条中文含义打印到终端（顺序同 Tuning 窗口从上到下）
             print("   " + _l)
         print("   按键: [c]清空ROI(恢复整幅) [u]切换去畸变 [s]保存参数 [q]退出")
@@ -860,11 +1035,14 @@ def run_gui(args):
         frame = undistort_frame(frame, undist_maps, undist_on)
         if gui_on:
             read_trackbars(cfg, detector, with_rs)  # headless 无滑条，用 JSON 载入的 cfg/detector
-            if with_rs:
-                rs_now = (cfg["rs_exposure"], cfg["rs_gain"], cfg["rs_white_balance"])
-                if rs_now != last_rs:
-                    cam.set_color_options(*rs_now)  # 成像滑条一变才实时下发给相机
-                    last_rs = rs_now
+        if with_rs:
+            # 【放在 gui_on 之外】cfg 里的成像值不仅可能来自本地滑条(read_trackbars)，也可能
+            # 来自网页参数面板(_set_param 直接改 cfg，见上文)——headless 模式没有本地滑条，
+            # 全靠网页改 cfg，这里必须每圈都检查一遍变没变，不能只在 gui_on 分支里做。
+            rs_now = (cfg["rs_exposure"], cfg["rs_gain"], cfg["rs_white_balance"])
+            if rs_now != last_rs:
+                cam.set_color_options(*rs_now)  # 成像值一变才实时下发给相机
+                last_rs = rs_now
         sub, (x0, y0) = apply_rect_roi(frame, cfg["roi_top"], cfg["roi_bottom"],
                                         cfg["roi_left"], cfg["roi_right"])
 
@@ -910,6 +1088,12 @@ def run_gui(args):
             # 实际写盘在后台线程，本调用只非阻塞入队，不拖慢主循环。
             mcu.write_video_frame(frame, measured_fps=fps_ema)
 
+        # 网页滑块改动的防抖持久化：静默 ≥1s 才写盘，避免拖动滑块时每次改动都写一次文件。
+        if params_dirty["since"] is not None and (time.time() - params_dirty["since"]) >= 1.0:
+            cfg["detector"] = detector.as_dict()
+            save_cfg(cfg)
+            params_dirty["since"] = None
+
         # ---- 显示 & 按键 ----
         # GUI 模式：重的绘制/imshow 限流到 DISPLAY_REFRESH_INTERVAL(~15Hz)，把 CPU 让给
         # 上面每圈都跑的采集+检测+串口发送，让 X 反馈频率尽量接近相机上限；按键也在这个
@@ -918,34 +1102,27 @@ def run_gui(args):
             now_draw = time.perf_counter()
             if (now_draw - last_draw) >= DISPLAY_REFRESH_INTERVAL:
                 last_draw = now_draw
-                # 左：整幅画面 + ROI 高亮 + 检测结果（绝对坐标）
+                # 左：整幅画面 + ROI 高亮(调暗) + 检测结果（绝对坐标）——本地窗口老样子不变
                 left = build_detection_overlay(frame, cfg, cands, primary, x0, y0, fps_ema, mcu, detect_ms_ema)
                 if stream_server is not None and stream_server.has_clients:
-                    stream_server.update_frame(left)  # 没人在看局域网画面就不用白编码浪费 CPU
+                    # 网页主画面单独画一版：不调暗 ROI 外区域，看到的是真实原始画面(只叠黄框
+                    # 参考线+绿色检测圈)，跟本地调参窗口的"调暗突出"风格分开，算法/坐标不受影响。
+                    web_left = build_detection_overlay(frame, cfg, cands, primary, x0, y0, fps_ema, mcu,
+                                                        detect_ms_ema, dim_roi=False)
+                    stream_server.update_frame(web_left)  # 没人在看局域网画面就不用白编码浪费 CPU
 
-                # 右：【高光二值掩膜】——ROI 内 HSV 的 V 通道按 hi_v 阈值二值化(V>hi_v 为白，
-                # 否则黑)，是 BallDetector 高光评分(specular)项用到的那个阈值的直接可视化。
+                # 右：球体二值掩膜（见 build_ball_mask_overlay 说明）。
                 # 【踩坑，实测复现过：左右面板坐标对不上】曾经在这里贴图前就用 ball_detector.draw()
                 # 在 ROI 局部坐标系的子图上画圈+印文字——文字是局部坐标(比如"(262,17)")，左图
                 # 用的是 draw_detections() 换算过的整幅画面绝对坐标(比如"(301,217)")，同一个球
                 # 两个面板显示两个不同的数字，看起来像识别出了两个不同位置，其实是同一份检测
-                # 结果、只是标签坐标系不一致。现在【先贴图、再在绝对坐标系里画】，和左图共用同一个
-                # draw_detections()，两个面板的圆圈/坐标标签就完全一致了（圆圈位置本来就是对的，
-                # 因为子图贴回画布时几何位置自动对齐，坏的只是印出来的文字数字）。
-                hsv_sub = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
-                hl_mask = cv2.inRange(hsv_sub[:, :, 2], int(detector.hi_v), 255)
-                hl_view = cv2.cvtColor(hl_mask, cv2.COLOR_GRAY2BGR)
-                mid = np.zeros((H, W, 3), np.uint8)
-                mid[y0:y0 + sub.shape[0], x0:x0 + sub.shape[1]] = hl_view
-                draw_detections(mid, cands, primary, x0, y0)  # 复用左图同款绝对坐标画法
-                cv2.line(mid, (0, cfg["roi_top"]), (W, cfg["roi_top"]), (0, 255, 255), 1, cv2.LINE_AA)
-                cv2.line(mid, (0, cfg["roi_bottom"] - 1), (W, cfg["roi_bottom"] - 1), (0, 255, 255), 1, cv2.LINE_AA)
-                cv2.line(mid, (cfg["roi_left"], 0), (cfg["roi_left"], H), (0, 255, 255), 1, cv2.LINE_AA)
-                cv2.line(mid, (cfg["roi_right"] - 1, 0), (cfg["roi_right"] - 1, H), (0, 255, 255), 1, cv2.LINE_AA)
-                cv2.putText(mid, f"HIGHLIGHT MASK (V>hi_v={detector.hi_v})", (8, 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+                # 结果、只是标签坐标系不一致。build_ball_mask_overlay 内部【先贴图、再在绝对
+                # 坐标系里画】，和左图共用同一个 draw_detections()，两个面板完全一致。
+                mid = build_ball_mask_overlay(detector, cfg, cands, primary, x0, y0, sub.shape[:2], H, W)
+                if stream_server is not None and stream_server.has_bin_clients:
+                    stream_server.update_bin_frame(mid)  # 没人看二值化窗口就不用白编码
 
-                # 主窗口 = 左:画面+检测(彩色) | 右:高光二值掩膜(黑白，调参用)
+                # 主窗口 = 左:画面+检测(彩色) | 右:球体二值掩膜(黑白，调参用)
                 panel = np.hstack([left, mid])
                 cv2.imshow(main_win, panel)
 
@@ -977,12 +1154,18 @@ def run_gui(args):
         else:
             # headless 无本地 GUI，但局域网画面仍可能有人在看：限流到 DISPLAY_REFRESH_INTERVAL
             # (~15Hz) 才画叠加层+编码，且只在真有客户端连着时才做，不白白占用主循环的 CPU。
-            if stream_server is not None and stream_server.has_clients:
+            if stream_server is not None and (stream_server.has_clients or stream_server.has_bin_clients):
                 now_draw = time.perf_counter()
                 if (now_draw - last_draw) >= DISPLAY_REFRESH_INTERVAL:
                     last_draw = now_draw
-                    overlay = build_detection_overlay(frame, cfg, cands, primary, x0, y0, fps_ema, mcu, detect_ms_ema)
-                    stream_server.update_frame(overlay)
+                    if stream_server.has_clients:
+                        # headless 没有本地窗口，直接就是给网页看的，不调暗 ROI 外区域。
+                        overlay = build_detection_overlay(frame, cfg, cands, primary, x0, y0, fps_ema, mcu,
+                                                           detect_ms_ema, dim_roi=False)
+                        stream_server.update_frame(overlay)
+                    if stream_server.has_bin_clients:
+                        mid = build_ball_mask_overlay(detector, cfg, cands, primary, x0, y0, sub.shape[:2], H, W)
+                        stream_server.update_bin_frame(mid)
             # headless：每 2s 打印一行状态，确认程序还活着、看当前反馈频率(FPS≈每秒发X次数)
             now_stat = time.perf_counter()
             if (now_stat - last_stat) >= 2.0:
