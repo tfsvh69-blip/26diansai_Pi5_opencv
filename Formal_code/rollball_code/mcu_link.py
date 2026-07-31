@@ -47,11 +47,20 @@ class _VideoRecorder:
     real_fps=(帧数-1)/(首尾时间差)，再真正建 writer、把缓冲的帧一次性冲下去、之后转入
     正常"收到就写"。STOP 如果在预热完成前就到了(录像很短)，就用已收集到的帧提前收尾。
     代价：每段录像开头有 ≤WARMUP_MIN_TIME 秒的决策延迟，但帧全部保留在缓冲区，不丢。
+
+    【2026-08-01 进一步修复：USB 相机帧"突发式到达"仍会让预热窗口测出虚高 fps】
+    实测录像 1x 播放比真实快 ~1.67 倍（用户要 0.6x 才贴合）：预热窗口只有 0.5s，撞上
+    USB 相机的"攒一批→一次吐一批"突刺就把帧率测虚高（比如实际 30fps 测成 50fps）。
+    两层修复：
+    1. 预热窗口拉长到 WARMUP_MIN_TIME=2s（跨多个突刺周期取平均，压低突刺影响）。
+    2. 收尾时用【整段录像】的首末帧墙钟时间算真实平均 fps，与封装 fps 偏差 >8% 就
+       读回 mp4 用真实 fps 重封装替换（短录像几秒内完成，1x 播放精确贴合真实时间）。
+       即使预热仍偏差（突刺周期 >2s 等），收尾校正兜底；不丢帧、不依赖 ffmpeg。
     """
 
-    WARMUP_MIN_FRAMES = 15   # 至少攒这么多帧才够算一个靠谱的 real_fps
-    WARMUP_MIN_TIME = 0.5    # 且至少经过这么久（帧数够但间隔极短也不算数）
-    WARMUP_MAX_FRAMES = 60   # 兜底上限：极端情况下也不能无限攒下去不开始写
+    WARMUP_MIN_FRAMES = 60   # 至少攒这么多帧才够算一个靠谱的 real_fps
+    WARMUP_MIN_TIME = 2.0    # 且至少经过这么久（跨多个突刺周期取平均，压掉相机突发性）
+    WARMUP_MAX_FRAMES = 150  # 兜底上限：极端情况下也不能无限攒下去不开始写
 
     def __init__(self, video_dir, fallback_fps=30, maxsize=60, log=print):
         self.video_dir = video_dir
@@ -113,24 +122,33 @@ class _VideoRecorder:
         state = "idle"        # idle / warming(攒帧算真实fps) / open(writer已建好)
         warmup = []            # [(frame, t_perf_counter), ...]，只在 warming 态使用
         pending_wh = None      # (w, h)，warming 态建 writer 时要用
+        # 整段录像的计数/首末帧时间戳/封装fps：收尾时用整段真实时长核对封装帧率，
+        # 偏差过大就重封装校正（见 _maybe_reencode）。每段 open 时重置。
+        rec_meta = None        # {"count", "first", "last", "used_fps"}
         while True:
             item = self._q.get()
             kind = item[0]
 
             if kind == "frame":
                 frame = item[1]
+                now = time.perf_counter()
+                if rec_meta is not None:
+                    if rec_meta["first"] is None:
+                        rec_meta["first"] = now
+                    rec_meta["last"] = now
+                    rec_meta["count"] += 1
                 if state == "open" and writer is not None:
                     writer.write(self._watermark(frame, task_id))
                 elif state == "warming":
                     # 预热阶段要把帧攒住等一小段时间才写，跟"open"态里帧一到就立即写掉不同，
                     # 必须 .copy()——不然如果上游相机/主线程复用同一块缓冲区，攒着的这些帧
                     # 会在真正写盘前被后面的帧数据覆盖掉。
-                    warmup.append((frame.copy(), time.perf_counter()))
-                    elapsed = warmup[-1][1] - warmup[0][1]
+                    warmup.append((frame.copy(), now))
+                    elapsed = now - warmup[0][1]
                     ready = (len(warmup) >= self.WARMUP_MIN_FRAMES and elapsed >= self.WARMUP_MIN_TIME) \
                         or len(warmup) >= self.WARMUP_MAX_FRAMES
                     if ready:
-                        writer, rec_path = self._finish_warmup(warmup, pending_wh, task_id)
+                        writer, rec_path = self._finish_warmup(warmup, pending_wh, task_id, rec_meta)
                         warmup = []
                         state = "open" if writer is not None else "idle"
 
@@ -138,36 +156,41 @@ class _VideoRecorder:
                 # 异常路径：上一段没正常 close 就来了新 open（无论上一段是"已建 writer"还是
                 # 还在"预热"），先把它当作要结束的一段收尾，避免帧丢在半空或 writer 泄漏。
                 if state == "warming" and warmup:
-                    w0, rp0 = self._finish_warmup(warmup, pending_wh, task_id)
+                    w0, rp0 = self._finish_warmup(warmup, pending_wh, task_id, rec_meta)
                     if w0 is not None:
                         w0.release()
                         self.log(f"💾 录像已保存 → {rp0}")
+                        self._maybe_reencode(rp0, rec_meta)
                     warmup = []
                 if writer is not None:
                     writer.release()
                     self.log(f"💾 录像已保存 → {rec_path}")
+                    self._maybe_reencode(rec_path, rec_meta)
                 writer, rec_path = None, None
                 _, w, h, _fps_hint, task_id = item
                 pending_wh = (w, h)
+                rec_meta = {"count": 0, "first": None, "last": None, "used_fps": None}
                 state = "warming"
 
             elif kind == "close":
                 if state == "warming":
-                    writer, rec_path = self._finish_warmup(warmup, pending_wh, task_id)
+                    writer, rec_path = self._finish_warmup(warmup, pending_wh, task_id, rec_meta)
                     warmup = []
                 if writer is not None:
                     writer.release()
                     self.log(f"💾 录像已保存 → {rec_path}")
+                    self._maybe_reencode(rec_path, rec_meta)
                 writer, rec_path = None, None
                 state = "idle"
 
             elif kind == "quit":
                 if state == "warming":
-                    writer, rec_path = self._finish_warmup(warmup, pending_wh, task_id)
+                    writer, rec_path = self._finish_warmup(warmup, pending_wh, task_id, rec_meta)
                     warmup = []
                 if writer is not None:
                     writer.release()
                     self.log(f"💾 录像已保存 → {rec_path}")
+                    self._maybe_reencode(rec_path, rec_meta)
                 break
 
     def _watermark(self, frame, task_id):
@@ -178,7 +201,7 @@ class _VideoRecorder:
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
         return rec
 
-    def _finish_warmup(self, warmup, wh, task_id):
+    def _finish_warmup(self, warmup, wh, task_id, rec_meta=None):
         """
         预热结束（攒够/STOP提前来）：用缓冲帧自己的时间戳算出这段录像的真实 fps，
         建 writer，把缓冲帧按顺序一次性冲下去。不足 2 帧算不出间隔，退回 fallback_fps。
@@ -191,13 +214,13 @@ class _VideoRecorder:
             real_fps = (len(warmup) - 1) / elapsed if elapsed > 0 else self.fallback_fps
         else:
             real_fps = self.fallback_fps
-        writer, rec_path = self._open_writer(w, h, real_fps, task_id)
+        writer, rec_path = self._open_writer(w, h, real_fps, task_id, rec_meta)
         if writer is not None:
             for frame, _t in warmup:
                 writer.write(self._watermark(frame, task_id))
         return writer, rec_path
 
-    def _open_writer(self, w, h, fps, task_id):
+    def _open_writer(self, w, h, fps, task_id, rec_meta=None):
         os.makedirs(self.video_dir, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = os.path.join(self.video_dir, f"{stamp}.mp4")
@@ -210,8 +233,82 @@ class _VideoRecorder:
         if not writer.isOpened():
             self.log(f"❌ 无法创建录像文件 {path}（mp4v 编码不可用？）")
             return None, None
+        if rec_meta is not None:
+            rec_meta["used_fps"] = use_fps
         self.log(f"🎥 开始录像 → {path}（TASK {task_id}, {use_fps:.1f}fps 实测）")
         return writer, path
+
+    def _maybe_reencode(self, path, rec_meta):
+        """
+        收尾校验：用整段录像的真实时长（首帧~末帧墙钟）核对封装 fps，偏差 >8% 就重封装校正，
+        让 1x 播放速度贴合真实世界（实测 USB 相机突发到达会让预热 fps 虚高 ~1.67x）。
+        短录像重封装几秒内完成、不阻塞主循环；失败保留原文件 + 告警，不崩。
+        """
+        if not path or rec_meta is None:
+            return
+        count = rec_meta.get("count") or 0
+        used = rec_meta.get("used_fps") or 0
+        first, last = rec_meta.get("first"), rec_meta.get("last")
+        if count < 2 or first is None or last is None or last <= first:
+            return
+        if not (0 < used <= 120):
+            return
+        real = (count - 1) / (last - first)
+        if not (0 < real <= 120):
+            return
+        if abs(real - used) / used < 0.08:
+            return  # 封装 fps 已贴合真实，跳过
+        self.log(f"📼 录像帧率校正: {used:.1f}→{real:.1f}fps（整段 {count} 帧 / 真实 "
+                 f"{(last - first):.1f}s，按真实时长重封装）")
+        if self._reencode_fps(path, real):
+            self.log(f"  已替换 → {path}")
+        else:
+            self.log(f"  ⚠️ 重封装失败，保留原文件（fps {used:.1f}）")
+
+    def _reencode_fps(self, path, fps):
+        """读回已落盘的 mp4，按指定 fps 重写一份再原子替换（mp4v 重编码，短录像很快）。
+        临时文件放在 video_dir 下的隐藏子目录里（保留 .mp4 后缀让 OpenCV 认出容器，实测
+        无后缀/陌生后缀 VideoWriter 打不开；子目录不会被网页录像列表扫到），重编码成功后
+        os.replace 原子替换。失败返回 False 保留原文件 + 清理临时目录。"""
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            cap.release()
+            return False
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = max(1.0, min(float(fps), 120.0))
+        tmpdir = os.path.join(self.video_dir, "_reencode_tmp")
+        os.makedirs(tmpdir, exist_ok=True)
+        tmp = os.path.join(tmpdir, os.path.basename(path))
+        vw = cv2.VideoWriter(tmp, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        if not vw.isOpened():
+            cap.release()
+            self._cleanup_tmpdir(tmpdir)
+            return False
+        try:
+            while True:
+                ok, fr = cap.read()
+                if not ok:
+                    break
+                vw.write(fr)
+        finally:
+            cap.release()
+            vw.release()
+        if not os.path.exists(tmp) or os.path.getsize(tmp) <= 0:
+            self._cleanup_tmpdir(tmpdir)
+            return False
+        os.replace(tmp, path)  # 同文件系统，原子替换
+        self._cleanup_tmpdir(tmpdir)
+        return True
+
+    def _cleanup_tmpdir(self, tmpdir):
+        """删掉重封装临时目录（含可能残留的半成品文件），失败静默忽略。"""
+        try:
+            for fn in os.listdir(tmpdir):
+                os.unlink(os.path.join(tmpdir, fn))
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
 
 
 class McuLink:

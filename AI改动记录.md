@@ -5,6 +5,62 @@
 
 ---
 
+## 2026-08-01 —— 修录像 1x 播放比真实快 ~1.67 倍（0.6x 才贴合）：USB 相机突发性导致预热测帧率虚高
+
+**动机**：用户上机试用网页回放后发现"录像 1x 播放比真实世界快，要 0.6x 才贴切"。已确认两条证据：录像时终端**没有**"⚠️ 录像写盘跟不上丢帧"告警（排除编码丢帧）、一段录像真实 START→STOP 约 5 秒。根因锁定：录像 fps 是在**开录后前 0.5s 预热窗口**里用帧到达时间戳测的（`mcu_link._VideoRecorder._finish_warmup`），USB 相机帧是"攒一批→一次吐一批"的突发式到达，窗口正好撞上突刺就把 fps 测虚高（实测元数据 49~53fps、真实 ~30fps，即 1.67 倍）。
+
+**改了哪些文件**：仅 `Formal_code/rollball_code/mcu_link.py`（`_VideoRecorder`，录像写盘后台线程）。
+
+1. **预热窗口拉长**：`WARMUP_MIN_FRAMES` 15→**60**、`WARMUP_MIN_TIME` 0.5→**2.0s**、`WARMUP_MAX_FRAMES` 60→**150**。2 秒窗口跨多个突刺周期取平均，从根上压低突发性影响（代价：录像开头最多延迟 2s 才开始写盘，但帧全部在内存缓冲、不丢，实测 2s 缓冲峰值 ~100 帧/92MB，Pi 5 无压力）。
+2. **收尾重封装校正（双保险）**：worker 循环新增 `rec_meta = {"count","first","last","used_fps"}` 记录整段录像的帧数/首末帧墙钟/封装 fps（每段 open 重置）；`_maybe_reencode` 在每段收尾（close/quit/重叠 open）时用**整段真实时长**算真实平均 fps，与封装 fps 偏差 **>8%** 就 `_reencode_fps` 读回 mp4、按真实 fps 重写一份再 `os.replace` 原子替换。即使突刺周期 >2s、预热仍偏差，收尾也兜底，1x 精确贴合真实时间。失败保留原文件 + 告警，不崩。
+3. **`_reencode_fps` 临时文件放 `video_dir/_reencode_tmp/` 子目录**（保留 `.mp4` 后缀——实测 OpenCV VideoWriter 对无后缀/陌生后缀**打不开**；子目录不会被网页录像列表 `os.listdir` 扫到），成功后原子替换 + 清临时目录。
+
+**效果/验证**（无相机，用合成帧直接驱动 `_VideoRecorder` 模拟真实节奏，三个用例全绿）：
+- **突刺开录**（前 2 批很密、之后 ~27fps）：预热测 45.2fps（虚高），收尾自动校正→34.2fps，文件时长 9.06s vs 实际 9.23s（偏差 <2%），日志打"📼 录像帧率校正: 45.2→34.2fps"。
+- **平稳 30fps**：2s 预热测准 29.9fps，无需校正，5.01s vs 5.02s。
+- **短录像提前 STOP**（1.2s，预热被截断）：1.20s vs 1.20s。
+- `py_compile` 三文件通过；网页回放链路自测（`/tmp/replay_selftest.py`）重跑无回归。
+- **上机验证留给用户**：再录一段，网页回放 1x 应贴合真实速度；终端看是否打印"📼 录像帧率校正"（仅当预热仍偏差时出现，属正常）。
+
+**回滚**：`Formal_code/` 未纳入 git，需手动还原 `mcu_link.py`（预热常量改回 15/0.5/60，删 `rec_meta` 线程/`_maybe_reencode`/`_reencode_fps`/`_cleanup_tmpdir`，`_finish_warmup`/`_open_writer` 去掉 `rec_meta` 参数，三处收尾去掉 `_maybe_reencode` 调用）。自测脚本 `/tmp/recorder_selftest.py`。
+
+---
+
+## 2026-08-01 —— 网页端回放录像（MJPEG 自建播放器，零新依赖）
+
+**动机**：用户希望网页端（:8080 那个页面）能直接看录像回放，而不是拷走 mp4 用本地播放器。现状是网页只有实时流；录像由单片机 TASK START/STOP 触发写 `Formal_code/mp4/*.mp4`，编码 **FMP4（MPEG-4 Part 2）**——现代浏览器 `<video>` 原生不支持，直接播会黑屏；Pi 上也没装 ffmpeg。用户选定方案：**复用现有网页服务 + 就播现有录像画面（不改录像逻辑）+ MJPEG 自建播放器**（OpenCV 读 mp4 + 复用 `_Stream` 推流机制，任何浏览器都能看，零新依赖）。
+
+**改了哪些文件**（2 个，均 `Formal_code/rollball_code/` 下；`Formal_code/` 未纳入 git，回滚需手动还原）：
+
+1. **`mjpeg_server.py`**
+   - 新类 **`_ReplayReader`**：per-connection 回放读取线程，按单调时钟累加绝对目标时刻 pacing（不漂移），`stop()` 先 join 再 `cap.release()`。
+   - 新类 **`_ReplayPlayer`**：列录像（`list_recordings`，按 mtime 倒序）/ 读元数据（`info`，按 `(size,mtime)` 缓存，录制中自动失效）/ 开流（`open_stream`，`CAP_PROP_POS_MSEC` seek + 探测 read 复位，**正在写入的 mp4 moov 未落盘会被探测判成打不开**）/ 单帧静图（`frame_jpeg`）。`_resolve` 做 basename + `.mp4` 校验防路径穿越。
+   - **4 个新路由**（`replay_dir` 传入才启用，None 时全部优雅降级）：`GET /api/recordings`（列表）、`GET /api/replay/info?file=`（元数据）、`GET /replay?file=&t=&speed=`（MJPEG 流）、`GET /replay/frame?file=&t=`（单帧 JPEG 静图）。
+   - **per-connection 独立 `_Stream`**：每条 `/replay` 连接建自己的 `_Stream`（独享编码线程），多客户端互不串台；`_serve_replay` 复用 `_serve_stream` 作内层推流，finally 停 reader + 流。
+   - **`MjpegServer.stop()` 兜底清理**：登记活跃回放连接（`_replay_started/_replay_finished`），`stop()` 时统一停掉 reader 和 per-connection 流——否则主程序退出时还挂着的回放 daemon 线程带着 `cv2.VideoCapture` 被强杀，实测会崩 **SIGABRT（"FATAL: exception not rethrown"）**。
+   - `index_html()` 加"回放"按钮 + 面板：录像下拉、播放/暂停、进度条（`onchange` 松手才 seek）、倍速（0.5/1/2/4）、时间标签。前端进度用**墙钟计时**（`t = playStartT + elapsed*speed`，到 duration 自动停），与服务器帧节奏解耦；暂停 = 把 `<img>` src 换成 `/replay/frame` 静图兜底（不依赖旧连接何时断开）。
+2. **`v1.1_beta.py`**（主循环**零改动**）
+   - 新增常量 `REPLAY_DIR = os.path.join(PROJECT_ROOT, "Formal_code", "mp4")`（定义在 `MjpegServer` 构造之前）。
+   - `MjpegServer(port=args.stream_port, replay_dir=REPLAY_DIR)` 接线回放目录。
+   - `McuLink(video_dir=REPLAY_DIR)` 改引用同一常量（原 `os.path.join(...)` 两处共用，防以后改目录漏改）。
+
+**关键事实/决策**：
+- 录像 fps 是每段实测的非整数（49~54），seek 必须用 `POS_MSEC` 而非按帧号算；OpenCV 能正常回读 + 跳帧（实测 3 个 mp4 全过）。
+- 前端"暂停"时浏览器对 `<img>` 换 src 会 abort 旧连接；服务器靠 `wfile.write` 报 `BrokenPipe` 收尾。**http.client 的优雅 close(FIN) 不会立即让服务器写报错**（TCP 写缓冲），reader 会跑到 EOF 才停——这是正常现象，浏览器关标签页是 RST、毫秒级清理（已实测 0.25s）。
+- 回放连接不触碰 `main.has_clients`，不会连带拉起直播编码，空闲零开销。
+
+**效果/验证**：
+- `py_compile` 两文件通过。
+- 独立集成自测脚本（合成 60 帧 160x120 mp4 + http.client / 原始 socket 断言）全绿：`/api/recordings` 倒序、`/api/replay/info` 元数据（fps≈30/frames=60/duration≈2）、路径穿越/不存在被拒、`/replay/frame` 返回 FFD8 JPEG、`/replay` 流读回 multipart 真实帧、**并发两连接不同 t 首帧内容不同（隔离）**、**RST 断连后 reader ≤3s 退出**、`server.stop()` 后无残留 reader 且不崩。
+- 用真实录像 `Formal_code/mp4/`（fps 49.65、1276 帧、640x480）重跑同一脚本全过，非整数 fps 的 seek/读取正常。
+- HTML 渲染检查：回放面板/JS 注入正确、占位符无残留、JS 花括号平衡。
+- `v1.1_beta.py` 模块导入 + 接线断言通过。
+- **浏览器手动验证留给用户上机**（需 Pi 上跑 `v1.1_beta.py --source usb --headless` 后手机/电脑开 `http://<IP>:8080/`）：录像下拉倒序、播放/暂停/拖动/倍速/播完自动停、录制中文件提示"正在写入或损坏"、两标签互不干扰、直播流仍正常。
+
+**回滚**：`Formal_code/` 未纳入 git，需手动还原 `mjpeg_server.py`（删两个新类/4 路由/回放面板，`MjpegServer.__init__` 去掉 `replay_dir` 与 `_replay_*` 登记）和 `v1.1_beta.py`（`REPLAY_DIR` 常量、`replay_dir=` 参数、`McuLink` 的 `video_dir` 改回 `os.path.join(...)`）。开发期自测脚本在 `/tmp/replay_selftest.py`（未入库）。
+
+---
+
 ## 2026-07-30 —— 网站开关改回默认开启（上一条已证实它不是帧率瓶颈）
 
 **动机**：上一条修好 RealSense 帧率协商 bug 后，用户上机实测**开着网站也一样有 30 多帧**，确认网站开销确实可以忽略，要求改回默认开启，并要求把结论更新进文档。

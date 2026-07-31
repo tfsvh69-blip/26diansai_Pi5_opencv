@@ -67,6 +67,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(HERE, "rollball_config.json")
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(HERE))
+# 录像落盘 + 网页回放共用同一目录（MjpegServer 的 replay_dir 与 McuLink 的 video_dir 都引它，
+# 改目录只需改这一处，不会漏改）。
+REPLAY_DIR = os.path.join(PROJECT_ROOT, "Formal_code", "mp4")
 
 # 复用 code/ready_code/camera_common 做相机标定读写 + 去畸变映射（唯一事实来源，不另写一份）
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "code", "ready_code"))
@@ -809,7 +812,9 @@ def run_gui(args):
     # 显式关掉（比如要绝对榨干最后一点余量、或者不想暴露局域网服务时）。
     stream_server = None
     if not args.no_stream:
-        stream_server = MjpegServer(port=args.stream_port)
+        # replay_dir=REPLAY_DIR：网页加"回放"入口，用 OpenCV 读录像 + 复用 MJPEG 推流，
+        # 不用装 ffmpeg（FMP4 编码浏览器 <video> 原生放不了，MJPEG 流任何浏览器都能看）。
+        stream_server = MjpegServer(port=args.stream_port, replay_dir=REPLAY_DIR)
         stream_server.start()
         print(f"🌐 局域网实时画面: http://{get_lan_ip()}:{args.stream_port}/ "
               f"（同一局域网/热点下的手机、电脑浏览器打开即可，摄像头就绪前先显示占位画面）")
@@ -936,7 +941,7 @@ def run_gui(args):
     # 非阻塞尝试连接，不卡视觉启动；真正开始回 PONG 要等下面主循环前置初始化都做完。
     mcu = None
     if not args.no_mcu:
-        mcu = McuLink(video_dir=os.path.join(PROJECT_ROOT, "Formal_code", "mp4"),
+        mcu = McuLink(video_dir=REPLAY_DIR,
                       video_fps=args.fps, port=args.mcu_port)
         print(f"🔌 单片机串口: port={args.mcu_port or '自动探测(CH340/ttyUSB)'}")
         mcu.try_open()
